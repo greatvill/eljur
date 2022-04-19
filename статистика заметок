@@ -1,0 +1,1079 @@
+<?php
+
+use App\Data\Notes\Model\Notes;
+use App\Data\Notes\Model\NoteRoleAuthor;
+use App\Data\Notes\Model\NotesComments;
+use App\Data\Notes\Model\NotesTypes;
+use App\Data\Notes\Model\Tag;
+use App\Data\Tutors\Models\Tutor;
+use App\Data\User\Models\JournalAddRole;
+use App\Data\User\Models\SitelliteUser;
+use App\System\Auth\AuthData;
+use Illuminate\Database\Query\Builder;
+use Illuminate\Database\Query\JoinClause;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
+
+class NoteStatisticController extends EljurApiController
+{
+    /**
+     * @param Request $request
+     * @return EljurRawResponse
+     * Разрез статистики по авторам
+     */
+    public function actionGetAuthors(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'filter' => 'array',
+            'filter.author_id' => 'integer',
+            'filter.roles' => 'array',
+            'filter.created_at_start' => 'date',
+            'filter.created_at_end' => 'date',
+            'filter.class.name' => 'required_with:filter.class.dep',
+            'filter.class.dep' => 'required_with:filter.class.name|int',
+
+            'sort' => 'array',
+            'sort.*' => 'in:asc,desc',
+
+            'perPage' => 'integer',
+        ]);
+
+        $filter = $data['filter'] ?? [];
+        $perPage = $data['perPage'] ?? 10;
+        $sort = $data['sort'] ?? [];
+
+        $paginator = $this->getPaginatorAuthor($filter, $sort, $perPage, true);
+        $roles = $this->getRoles();
+        $paginator->transform(function ($item) use ($roles, $filter) {
+            $item->roles = $roles->get($item->id);
+            $item->link_monitor = $this->generationLinkMonitor($item->id, $filter, 'author');
+            return $item;
+        });
+        $res = [];
+        if ($paginator->isNotEmpty()) {
+            $resume = $this->getResumeAuthor($filter);
+            $res = $this->addResume($paginator, $resume);
+        }
+
+        return $this->sendResult($res);
+    }
+
+    /**
+     * @param array $filter
+     * @param array $sort
+     * @param int $perPage
+     * @param bool $withMinMaxTutor Добавить подсчет по мин-макс значению по тьюторантам
+     * @return \Illuminate\Pagination\LengthAwarePaginator
+     */
+    protected function getPaginatorAuthor(array $filter, array $sort, int $perPage, bool $withMinMaxTutor = false): Illuminate\Pagination\LengthAwarePaginator
+    {
+        $conditionsNotes = [];
+        $conditionsComments = [];
+        $query = db()->table(sprintf('%s as author_table', SitelliteUser::TABLE))
+            ->select([
+                'author_table.id',
+                'author_table.firstname',
+                'author_table.lastname',
+                'author_table.middlename',
+            ])
+            ->leftJoin(Notes::TABLE,
+                'author_table.id',
+                sprintf('%s.author', Notes::TABLE))
+            ->leftJoin(NotesComments::TABLE,
+                sprintf('%s.author_id', NotesComments::TABLE),
+                'author_table.id')
+            ->leftJoin(Notes::TABLE . ' as notes_for_comments',
+                sprintf('%s.note_id', NotesComments::TABLE),
+                'notes_for_comments.id')
+            ->groupBy(
+                'author_table.id',
+                'author_table.firstname',
+                'author_table.lastname',
+                'author_table.middlename'
+            );
+
+        //Убираем родителей, членов РК, системных пользователей
+        $ids = SitelliteUser::query()
+            ->leftJoin(JournalAddRole::TABLE . ' AS jar', 'jar.username', '=', SitelliteUser::TABLE . '.id')
+            ->where(function ($w) {
+                $w->whereNotIn(SitelliteUser::TABLE . '.role', [AuthData::ROLE_PARENT, AuthData::ROLE_MEMBER_PTA])
+                    ->orWhereNotIn('jar.role', [AuthData::ROLE_PARENT, AuthData::ROLE_MEMBER_PTA]);
+            })
+            ->whereNotIn(SitelliteUser::TABLE . '.username', [
+                SitelliteUser::LOGIN_API_HELPER,
+                SitelliteUser::LOGIN_STATISTICS,
+                SitelliteUser::LOGIN_STATISTICS_2,
+            ])
+            ->distinct()
+            ->pluck('id')
+            ->toArray();
+
+        $query->whereIn('author_table.id', $ids);
+        if ($filter) {
+            if ($userId = $filter['author_id'] ?? false) {
+                $query->where(sprintf('%s.id', 'author_table'), $userId);
+            }
+            if ($roles = $filter['roles'] ?? false) {
+                //join'им для заметок
+                $query
+                    ->leftJoin(NoteRoleAuthor::TABLE, function (JoinClause $join) {
+                        $join->on(
+                            sprintf('%s.id', Notes::TABLE),
+                            sprintf('%s.related_id', NoteRoleAuthor::TABLE))
+                            ->where(sprintf('%s.type', NoteRoleAuthor::TABLE), NoteRoleAuthor::NOTE_TYPE);
+                    });
+                //join'им для комментов
+                $query->leftJoin(NoteRoleAuthor::TABLE . ' as note_role_for_comments', function (JoinClause $join) {
+                    $join->on(
+                        'notes_for_comments.id',
+                        'note_role_for_comments.related_id')
+                        ->where('note_role_for_comments.type', NoteRoleAuthor::COMMENT_TYPE);
+                });
+
+                //добавляем условия для подсчета
+                $rolesImploded = sprintf('"%s"', array_shift($roles));
+                foreach ($roles as $r) {
+                    $rolesImploded .= sprintf(',"%s"', $r);
+                }
+
+                $conditionsNotes[] = sprintf('%s.role in (%s)', NoteRoleAuthor::TABLE, $rolesImploded);
+                $conditionsComments[] = sprintf('%s.role in (%s)', 'note_role_for_comments', $rolesImploded);
+
+            }
+            if ($class = $filter['class'] ?? false) {
+                $j = new Journal();
+                $studentsForFilter = array_keys($j->getStudentList($class['name'], $class['dep']));
+                $studentsImploded = implode(',', $studentsForFilter);
+                //добавляем условия для подсчета
+                $conditionsNotes[] = sprintf('%s.student_id in (%s)', Notes::TABLE, $studentsImploded);
+                $conditionsComments[] = sprintf('%s.student_id in (%s)', 'notes_for_comments', $studentsImploded);
+            }
+            if ($studentId = $filter['student_id'] ?? false) {
+                //добавляем условия для подсчета
+                $conditionsNotes[] = sprintf('%s.student_id = %s', Notes::TABLE, $studentId);
+                $conditionsComments[] = sprintf('%s.student_id = %s', 'notes_for_comments', $studentId);
+            }
+            if ($createdAtStart = $filter['created_at_start'] ?? false) {
+                $createdAtStart = Carbon::parse($createdAtStart)->format('Y-m-d');
+                $conditionsNotes[] = sprintf('%s.created_at >= "%s"', Notes::TABLE, $createdAtStart);
+                $conditionsComments[] = sprintf('%s.created_at >= "%s"', 'notes_for_comments', $createdAtStart);
+            }
+            if ($createdAtEnd = $filter['created_at_end'] ?? false) {
+                $createdAtEnd = Carbon::parse($createdAtEnd);
+                $createdAtEnd = $createdAtEnd->endOfDay()->format('Y-m-d H:i:s');
+                $conditionsNotes[] = sprintf('%s.created_at <= "%s"', Notes::TABLE, $createdAtEnd);
+                $conditionsComments[] = sprintf('%s.created_at <= "%s"', 'notes_for_comments', $createdAtEnd);
+            }
+            if ($typeNote = $filter['type_note_id'] ?? false) {
+                $conditionsNotes[] = sprintf('%s.type_note_id = %s', Notes::TABLE, $typeNote);
+                $conditionsComments[] = sprintf('%s.type_note_id = %s', 'notes_for_comments', $typeNote);
+            }
+            if ($tags = $filter['tags'] ?? false) {
+
+                $notesIdsWithTags = db()->table('note_tag')
+                    ->whereIn('note_tag.tag_id', $tags)
+                    ->pluck('note_id')
+                    ->toArray();
+                $notesIdsWithTagsImploded = implode(', ', $notesIdsWithTags);
+                $conditionsNotes [] = sprintf('%s.id in (%s)', Notes::TABLE, $notesIdsWithTagsImploded);
+                $conditionsComments [] = sprintf('%s.id in (%s)', 'notes_for_comments', $notesIdsWithTagsImploded);
+            }
+        }
+
+        if ($conditionsNotes) {
+            $conditionsNotes = implode(' and ', $conditionsNotes);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as notes_total',
+                    $conditionsNotes,
+                    Notes::TABLE))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as notes_total', Notes::TABLE)));
+        }
+
+        if ($conditionsComments) {
+            $conditionsComments = implode(' and ', $conditionsComments);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as comments_total',
+                    $conditionsComments,
+                    'notes_comments'))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as comments_total', 'notes_comments')));
+        }
+
+        //Сортировка
+        if ($sort) {
+            if ($sort['author']) {
+                $query
+                    ->orderBy('author_table.lastname', $sort['author'])
+                    ->orderBy('author_table.firstname', $sort['author'])
+                    ->orderBy('author_table.middlename', $sort['author']);
+            }
+            if ($sort['notes_total']) {
+                $query
+                    ->orderBy('notes_total', $sort['notes_total']);
+            }
+            if ($sort['comments_total']) {
+                $query
+                    ->orderBy('comments_total', $sort['comments_total']);
+            }
+        }
+        $query->having('notes_total', '>', 0)
+            ->orHaving('comments_total', '>', 0);
+
+        // Минимальное и максимальное количество заметок по тьюторантам
+
+        /**
+         * @var $queryNotesStudents Builder
+         * Запрос на получение количества заметок тьютором по каждому ученику
+         */
+        if ($withMinMaxTutor) {
+            $dateNow = \Carbon\Carbon::today()->toDateString();
+            $year = DomainYear::getStudyYearByDate($dateNow)->getString();
+            $queryNotesByTutor = db()->table(Notes::TABLE)
+                ->select([
+                    sprintf('%s.author as author_id', Notes::TABLE),
+                    sprintf('%s.student_id', Notes::TABLE),
+                    db()->raw('count(*) total'),
+                ])
+                ->join(Tutor::TABLE, function (JoinClause $join) use ($dateNow, $year) {
+                    $join->on(
+                        sprintf('%s.tutor_id', Tutor::TABLE),
+                        sprintf('%s.author', Notes::TABLE))
+                        ->on(
+                            sprintf('%s.student_id', Tutor::TABLE),
+                            sprintf('%s.student_id', Notes::TABLE)
+                        )
+                        ->where('date_start', '<=', $dateNow)
+                        ->where(function (Builder $q) use ($dateNow) {
+                            $q->where('date_end', '>', $dateNow)
+                                ->orWhere('date_end', '=', null);
+                        })
+                        ->where('year', $year);
+                })
+                ->groupBy('author_id', 'student_id');
+
+            if ($filter) {
+                if ($userId) {
+                    $queryNotesByTutor->where(sprintf('%s.author', Notes::TABLE), $userId);
+                }
+                if (isset($studentsForFilter)) {
+                    $queryNotesByTutor->whereIn(sprintf('%s.student_id', Notes::TABLE), $studentsForFilter);
+                }
+                if ($createdAtStart = $filter['created_at_start'] ?? false) {
+                    $createdAtStart = Carbon::parse($createdAtStart)->format('Y-m-d');
+                    $queryNotesByTutor->whereDate(sprintf('%s.created_at', Notes::TABLE), '>=', $createdAtStart);
+                }
+                if ($createdAtEnd = $filter['created_at_end'] ?? false) {
+                    $createdAtEnd = Carbon::parse($createdAtEnd);
+                    $createdAtEnd = $createdAtEnd->endOfDay()->format('Y-m-d H:i:s');
+                    $queryNotesByTutor->whereDate(sprintf('%s.created_at', Notes::TABLE), '<=', $createdAtEnd);
+                }
+                if ($typeNote = $filter['type_note_id'] ?? false) {
+                    $queryNotesByTutor->where(sprintf('%s.type_note_id', Notes::TABLE), $typeNote);
+                }
+                if (isset($notesIdsWithTags)) {
+                    $queryNotesByTutor->whereIn(sprintf('%s.id', Notes::TABLE), $notesIdsWithTags);
+                }
+            }
+            $queryMinMaxTutor = db()->query()->fromSub($queryNotesByTutor, 'src')
+                ->select([
+                    'src.author_id',
+                    db()->raw('min(src.total) min_note'),
+                    db()->raw('max(src.total) max_note'),
+                ])->groupBy('src.author_id');
+
+            $query->leftJoinSub($queryMinMaxTutor, 'min_max_tutor',
+                'min_max_tutor.author_id',
+                'author_table.id');
+
+            $query->addSelect([
+                'min_max_tutor.min_note',
+                'min_max_tutor.max_note',
+            ]);
+        }
+
+        return $query->paginate($perPage);
+    }
+
+    public function getRoles(): Collection
+    {
+        $queryNotes = db()->table(NoteRoleAuthor::TABLE)
+            ->select([
+                sprintf('%s.role', NoteRoleAuthor::TABLE),
+                sprintf('%s.author as author_id', Notes::TABLE)
+            ])
+            ->join(Notes::TABLE, function (JoinClause $join) {
+                $join->on(
+                    sprintf('%s.id', Notes::TABLE),
+                    sprintf('%s.related_id', NoteRoleAuthor::TABLE))
+                    ->where(sprintf('%s.type', NoteRoleAuthor::TABLE), NoteRoleAuthor::NOTE_TYPE);
+            });
+        //роли по комментариям
+        $queryComments = db()->table(NoteRoleAuthor::TABLE)
+            ->select([
+                sprintf('%s.role', NoteRoleAuthor::TABLE),
+                sprintf('%s.author as author_id', Notes::TABLE),
+            ])
+            ->join(NotesComments::TABLE, function (JoinClause $join) {
+                $join->on(
+                    sprintf('%s.id', NotesComments::TABLE),
+                    sprintf('%s.related_id', NoteRoleAuthor::TABLE))
+                    ->where(sprintf('%s.type', NoteRoleAuthor::TABLE), NoteRoleAuthor::COMMENT_TYPE);
+            })
+            ->join(Notes::TABLE,
+                sprintf('%s.note_id', NotesComments::TABLE),
+                sprintf('%s.id', Notes::TABLE)
+            );
+
+        $noteRoles = $queryNotes->get();
+        $commentRoles = $queryComments->get();
+        return $noteRoles->merge($commentRoles)
+            ->unique()
+            ->groupBy('author_id')
+            ->map(function (Collection $items) {
+                return $items
+                    ->sortBy($this->sortRole())
+                    ->values()
+                    ->map(function ($i) {
+                        return trans("role.{$i->role}");
+                    });
+            });
+    }
+
+    protected function generationLinkMonitor(int $userId, array $filter, string $type): string
+    {
+        $url = '/journal-study-action/s.monitor/p.notes/t.statistics?';
+        $params = [];
+        if ($type === 'author') {
+            $params['author_id'] = $userId;
+        } elseif ($type === 'student') {
+            $params['user_destination'] = $userId;
+        }
+
+        if ($filter) {
+            if (isset($filter['created_at_start'])) {
+                $params['cdate_from'] = Carbon::parse($filter['created_at_start'])->format('d-m-Y');
+            }
+            if (isset($filter['created_at_end'])) {
+                $params['cdate_to'] = Carbon::parse($filter['created_at_end'])->format('d-m-Y');
+            }
+            if (isset($filter['tags'])) {
+                $params['tag_id'] = $filter['tags'][0];
+            }
+            if (isset($filter['type_note_id'])) {
+                $params['type'] = $filter['type_note_id'];
+            }
+        }
+        return $url . http_build_query($params);
+    }
+
+    /**
+     * @param Request $request
+     * @return EljurRawResponse
+     * Поиск осуществляется по всем пользователям системы, за исключением родителей, потому что родители заметки не пишут
+     */
+    public function actionSearchAuthors(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'value' => 'string',
+        ]);
+
+        $users = $this->searchAuthor($data['value'] ?? '');
+        return $this->sendResult($users);
+    }
+
+    /**
+     * @param Request $request
+     * @return EljurRawResponse
+     * Поиск осуществляется по всем обучающимся системы
+     */
+    public function actionSearchStudents(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'value' => 'string',
+        ]);
+        $partName = $data['value'] ?? '';
+        $users = SitelliteUser::query()
+            ->select([
+                'id',
+                'lastname',
+                'firstname',
+                'middlename',
+                'dep'
+            ])
+            ->where(sprintf('%s.role', SitelliteUser::TABLE), AuthData::ROLE_STUDENT)
+            ->where(function ($where) use ($partName) {
+                $where->where('sitellite_user.lastname', 'like', "$partName%")
+                    ->orWhere('sitellite_user.firstname', 'like', "$partName%")
+                    ->orWhere('sitellite_user.middlename', 'like', "$partName%");
+            })
+            ->where(sprintf('%s.password', SitelliteUser::TABLE), '!=', 'removed')
+            ->orderBy('lastname')
+            ->get()
+            ->keyBy('id');
+
+        Core::getUsersCacheFacade()->prefetchUsersByIds($users->keys()->toArray());
+        $users = $users->toArray();
+        $res = [];
+        $allDeps = Core::getAllDeps();
+        foreach ($users as $id => $u) {
+            $dep = Core::getCurrentDep($id);
+            $res[$allDeps[$dep] ?? '-'][] = $u;
+        }
+
+        return $this->sendResult($res);
+    }
+
+    protected function searchAuthor(string $partName): array
+    {
+        $users = SitelliteUser::query()
+            ->select([
+                'id',
+                'lastname',
+                'firstname',
+                'middlename',
+            ])
+            ->leftJoin(JournalAddRole::TABLE . ' AS jar', 'jar.username', '=', SitelliteUser::TABLE . '.id')
+            ->where(function ($where) use ($partName) {
+                $where->where(SitelliteUser::TABLE . '.lastname', 'like', "$partName%")
+                    ->orWhere(SitelliteUser::TABLE . '.firstname', 'like', "$partName%")
+                    ->orWhere(SitelliteUser::TABLE . '.middlename', 'like', "$partName%");
+            })
+            ->where(SitelliteUser::TABLE . '.password', '!=', 'removed')
+            ->where(function ($w) {
+                $w->whereNotIn(SitelliteUser::TABLE . '.role', [AuthData::ROLE_PARENT, AuthData::ROLE_MEMBER_PTA])
+                    ->orWhereNotIn('jar.role', [AuthData::ROLE_PARENT, AuthData::ROLE_MEMBER_PTA]);
+            })
+            ->whereNotIn(SitelliteUser::TABLE . '.username', [
+                SitelliteUser::LOGIN_API_HELPER,
+                SitelliteUser::LOGIN_STATISTICS,
+                SitelliteUser::LOGIN_STATISTICS_2,
+            ])
+            ->distinct()
+            ->orderBy('lastname')
+            ->get()
+            ->keyBy('id');
+
+        Core::getUsersCacheFacade()->prefetchUsersByIds($users->keys()->toArray());
+        $users = $users->toArray();
+        $res = [];
+        $allDeps = Core::getAllDeps();
+        foreach ($users as $id => $u) {
+            $dep = Core::getCurrentDep($id);
+            $res[$allDeps[$dep] ?? '-'][] = $u;
+        }
+        return $res;
+    }
+
+    protected function sortRole(): Closure
+    {
+        $customSort = [
+            'tutor',
+            'class_teacher',
+        ];
+        return (static function ($noteRole) use ($customSort) {
+            $number = array_search($noteRole->role, $customSort, true);
+            return $number !== false ? $number : count($customSort);
+        });
+    }
+
+    public function actionInitFilter(): EljurRawResponse
+    {
+        $startYearDate = Core::domainYear()->getStartDate();
+        $endYearDate = Core::domainYear()->getEndDate();
+        $now = Carbon::now();
+        $endYearDate = strtotime($endYearDate) > $now->getTimestamp() ? $now->format('Y-m-d') : $endYearDate;
+        return $this->sendResult([
+            'roles' => $this->getAllRoles(),
+            'classes' => $this->getClasses(),
+            'types' => $this->getTypes(),
+            'tags' => $this->getTags(),
+            'date_start' => $startYearDate,
+            'date_end' => $endYearDate,
+            'deps' => Core::getAllDeps(),
+        ]);
+    }
+
+    protected function getAllRoles(): array
+    {
+        $roles = [
+            AuthData::ROLE_TUTOR,
+            'class_teacher',
+            AuthData::ROLE_TEACHER,
+            AuthData::ROLE_PSYCHOLOGIST,
+            AuthData::ROLE_STUDENT,
+            AuthData::ROLE_SOCIAL_TEACHER,
+            AuthData::ROLE_NURSE,
+            AuthData::ROLE_ADMINISTRATOR,
+            AuthData::ROLE_LIBRARIAN,
+            AuthData::ROLE_SECRETARY,
+        ];
+        return array_map(static function ($r) {
+            return [
+                'code' => $r,
+                'name' => trans("role.$r")
+            ];
+        }, $roles);
+    }
+
+    protected function getClasses(): array
+    {
+        $facade = Core::getClassesCacheFacade();
+        $classes = $facade->getAllClasses();
+        $res = [];
+        foreach ($classes as $cList) {
+            foreach ($cList as $c) {
+                $res[$c->dep][] = $c->name;
+            }
+        }
+        foreach ($res as &$cList) {
+            sort($cList, SORT_NUMERIC);
+        }
+        return $res;
+    }
+
+    protected function getTypes()
+    {
+        return NotesTypes::query()
+            ->select([
+                'id',
+                'name',
+            ])
+            ->get()
+            ->keyBy('id')
+            ->forget(NotesTypes::TYPE_REBUKE_ID)
+            ->values();
+    }
+
+    protected function getTags()
+    {
+        return Tag::query()
+            ->select([
+                'id',
+                'name',
+            ])
+            ->get();
+    }
+
+    public function actionDetailStudent($request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'filter' => 'array',
+            'filter.author_id' => 'integer',
+            'filter.roles' => 'array',
+            'filter.created_at_start' => 'date',
+            'filter.created_at_end' => 'date',
+            'filter.student_id' => 'required|integer',
+            'sort' => 'array',
+            'sort.*' => 'in:asc,desc',
+
+            'perPage' => 'integer',
+        ]);
+
+        $filter = $data['filter'] ?? [];
+        $perPage = $data['perPage'] ?? 10;
+        $sort = $data['sort'] ?? [];
+
+        $paginator = $this->getPaginatorAuthor($filter, $sort, $perPage);
+
+        $result = [];
+        if ($paginator->isNotEmpty()) {
+            $roles = $this->getRoles();
+            $paginator->transform(function ($item) use ($roles, $filter) {
+                $item->roles = $roles->get($item->id);
+                $item->link_monitor = $this->generationLinkMonitor($item->id, $filter, 'author');
+                return $item;
+            });
+            $resume = $this->getResumeAuthor($filter);
+            $result = $this->addResume($paginator, $resume);
+        }
+        $user = Core::getUsersCacheFacade()->getById($filter['student_id']);
+        if ($user) {
+            $result['student'] = [
+                'id' => $user->id,
+                'firstname' => $user->firstname,
+                'middlename' => $user->middlename,
+                'lastname' => $user->lastname,
+                'class' => (new NewTransition)->getStudentClass($user->id),
+            ];
+        }
+
+        return $this->sendResult($result);
+    }
+
+    protected function addResume(Illuminate\Pagination\LengthAwarePaginator $paginator, $resume): array
+    {
+        $resultData = $paginator->toArray();
+        $resultData['resume'] = [
+            'notes_total' => $resume->notes_total,
+            'comments_total' => $resume->comments_total,
+        ];
+
+        return $resultData;
+    }
+
+    public function actionGetStudents($request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'filter' => 'array',
+            'filter.author_id' => 'integer',
+            'filter.roles' => 'array',
+            'filter.created_at_start' => 'date',
+            'filter.created_at_end' => 'date',
+            'filter.class.name' => 'required_with:filter.class.dep',
+            'filter.class.dep' => 'required_with:filter.class.name|int',
+            'sort' => 'array',
+            'sort.*' => 'in:asc,desc',
+
+            'perPage' => 'integer',
+        ]);
+
+        $filter = $data['filter'] ?? [];
+        $perPage = $data['perPage'] ?? 10;
+        $sort = $data['sort'] ?? [];
+
+        $paginator = $this->getPaginatorStudent($filter, $sort, $perPage);
+        $result = [];
+        if ($paginator->isNotEmpty()) {
+            $studentIds = $paginator->getCollection()->pluck('id')->unique();
+            Core::getTransitionCacheFacade()->getForUsernames($studentIds->all());
+            $paginator->transform(function ($i) use ($filter) {
+                $i->class = (new Transition())->getStudentClass($i->id);
+                $i->link_monitor = $this->generationLinkMonitor($i->id, $filter, 'student');
+                return $i;
+            });
+            $resume = $this->getResumeStudent($filter);
+            $result = $this->addResume($paginator, $resume);
+        }
+
+        return $this->sendResult($result);
+    }
+
+    protected function getPaginatorStudent(array $filter, array $sort, int $perPage): Illuminate\Pagination\LengthAwarePaginator
+    {
+        $conditionsNotes = [];
+        $conditionsComments = [];
+        $query = db()->table(sprintf('%s as student_table', SitelliteUser::TABLE))
+            ->select([
+                'student_table.id',
+                'student_table.firstname',
+                'student_table.lastname',
+                'student_table.middlename',
+            ])
+            ->leftJoin(Notes::TABLE,
+                'student_table.id',
+                sprintf('%s.student_id', Notes::TABLE))
+            ->leftJoin(NotesComments::TABLE,
+                sprintf('%s.student_id', NotesComments::TABLE),
+                'student_table.id')
+            ->leftJoin(Notes::TABLE . ' as notes_for_comments',
+                sprintf('%s.note_id', NotesComments::TABLE),
+                'notes_for_comments.id')
+            ->groupBy(
+                'student_table.id',
+                'student_table.firstname',
+                'student_table.lastname',
+                'student_table.middlename'
+            );
+
+        if ($filter) {
+            if ($authorId = $filter['author_id'] ?? false) {
+                $conditionsNotes[] = sprintf('%s.author = %s', Notes::TABLE, $authorId);
+                $conditionsComments[] = sprintf('%s.author_id = %s', NotesComments::TABLE, $authorId);
+            }
+            if ($roles = $filter['roles'] ?? false) {
+                //join'им для заметок
+                $query
+                    ->leftJoin(NoteRoleAuthor::TABLE, function (JoinClause $join) {
+                        $join->on(
+                            sprintf('%s.id', Notes::TABLE),
+                            sprintf('%s.related_id', NoteRoleAuthor::TABLE))
+                            ->where(sprintf('%s.type', NoteRoleAuthor::TABLE), NoteRoleAuthor::NOTE_TYPE);
+                    });
+                //join'им для комментов
+                $query->leftJoin(NoteRoleAuthor::TABLE . ' as note_role_for_comments', function (JoinClause $join) {
+                    $join->on(
+                        'notes_for_comments.id',
+                        'note_role_for_comments.related_id')
+                        ->where('note_role_for_comments.type', NoteRoleAuthor::COMMENT_TYPE);
+                });
+
+                //добавляем условия для подсчета
+                $rolesImploded = sprintf('"%s"', array_shift($roles));
+                foreach ($roles as $r) {
+                    $rolesImploded .= sprintf(',"%s"', $r);
+                }
+
+                $conditionsNotes[] = sprintf('%s.role in (%s)', NoteRoleAuthor::TABLE, $rolesImploded);
+                $conditionsComments[] = sprintf('%s.role in (%s)', 'note_role_for_comments', $rolesImploded);
+
+            }
+            if ($class = $filter['class'] ?? false) {
+                //whereIn id
+                $j = new Journal();
+                $studentsForFilter = array_keys($j->getStudentList($class['name'], $class['dep']));
+                $query->whereIn('student_table.id', $studentsForFilter);
+            }
+            if ($studentId = $filter['student_id'] ?? false) {
+                $query->where('student_table.id', $studentId);
+            }
+            if ($createdAtStart = $filter['created_at_start'] ?? false) {
+                $createdAtStart = Carbon::parse($createdAtStart)->format('Y-m-d');
+                $conditionsNotes[] = sprintf('%s.created_at >= "%s"', Notes::TABLE, $createdAtStart);
+                $conditionsComments[] = sprintf('%s.created_at >= "%s"', 'notes_for_comments', $createdAtStart);
+            }
+            if ($createdAtEnd = $filter['created_at_end'] ?? false) {
+                $createdAtEnd = Carbon::parse($createdAtEnd);
+                $createdAtEnd = $createdAtEnd->endOfDay()->format('Y-m-d H:i:s');
+                $conditionsNotes[] = sprintf('%s.created_at <= "%s"', Notes::TABLE, $createdAtEnd);
+                $conditionsComments[] = sprintf('%s.created_at <= "%s"', 'notes_for_comments', $createdAtEnd);
+            }
+            if ($typeNote = $filter['type_note_id'] ?? false) {
+                $conditionsNotes[] = sprintf('%s.type_note_id = %s', Notes::TABLE, $typeNote);
+                $conditionsComments[] = sprintf('%s.type_note_id = %s', 'notes_for_comments', $typeNote);
+            }
+            if ($tags = $filter['tags'] ?? false) {
+
+                $notesIdsWithTags = db()->table('note_tag')
+                    ->whereIn('note_tag.tag_id', $tags)
+                    ->pluck('note_id')
+                    ->toArray();
+                $notesIdsWithTagsImploded = implode(', ', $notesIdsWithTags);
+                $conditionsNotes [] = sprintf('%s.id in (%s)', Notes::TABLE, $notesIdsWithTagsImploded);
+                $conditionsComments [] = sprintf('%s.id in (%s)', 'notes_for_comments', $notesIdsWithTagsImploded);
+            }
+        }
+
+        if ($conditionsNotes) {
+            $conditionsNotes = implode(' and ', $conditionsNotes);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as notes_total',
+                    $conditionsNotes,
+                    Notes::TABLE))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as notes_total', Notes::TABLE)));
+        }
+
+        if ($conditionsComments) {
+            $conditionsComments = implode(' and ', $conditionsComments);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as comments_total',
+                    $conditionsComments,
+                    'notes_comments'))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as comments_total', 'notes_comments')));
+        }
+
+        //Сортировка
+        if ($sort) {
+            if ($sort['author']) {
+                $query
+                    ->orderBy('student_table.lastname', $sort['author'])
+                    ->orderBy('student_table.firstname', $sort['author'])
+                    ->orderBy('student_table.middlename', $sort['author']);
+            }
+            if ($sort['notes_total']) {
+                $query
+                    ->orderBy('notes_total', $sort['notes_total']);
+            }
+            if ($sort['comments_total']) {
+                $query
+                    ->orderBy('comments_total', $sort['comments_total']);
+            }
+        }
+        $query->having('notes_total', '>', 0)
+            ->orHaving('comments_total', '>', 0);
+
+        return $query->paginate($perPage);
+    }
+
+    public function actionDetailAuthor($request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'filter' => 'array',
+            'filter.author_id' => 'integer|required',
+            'filter.roles' => 'array',
+            'filter.created_at_start' => 'date',
+            'filter.created_at_end' => 'date',
+            'filter.class.name' => 'required_with:filter.class.dep',
+            'filter.class.dep' => 'required_with:filter.class.name|int',
+
+            'sort' => 'array',
+            'sort.*' => 'in:asc,desc',
+
+            'perPage' => 'integer',
+        ]);
+
+        $filter = $data['filter'] ?? [];
+        $perPage = $data['perPage'] ?? 10;
+        $sort = $data['sort'] ?? [];
+
+        $paginator = $this->getPaginatorStudent($filter, $sort, $perPage);
+        $result = [];
+        if ($paginator->isNotEmpty()) {
+            Core::getTransitionCacheFacade()->getForUsernames($paginator->pluck('id')->all());
+            $transition = new Transition();
+            $paginator->transform(function ($i) use ($filter, $transition) {
+                $i->link_monitor = $this->generationLinkMonitor($i->id, $filter, 'student');
+                $i->class = $transition->getStudentClass($i->id);
+                return $i;
+            });
+            $resume = $this->getResumeStudent($filter);
+            $result = $this->addResume($paginator, $resume);
+        }
+
+        $user = Core::getUsersCacheFacade()->getById($filter['author_id']);
+
+        if ($user) {
+            $customSort = [
+                AuthData::ROLE_TUTOR,
+                'class_teacher',
+            ];
+            $roles = array_filter(Core::getRoles($user->id));
+
+            if ($roles) {
+                usort($roles, static function ($r) use ($customSort) {
+                    $number = array_search($r, $customSort, true);
+                    return $number !== false ? $number : count($customSort);
+                });
+
+                $roles = array_map(static function ($i) {
+                    return trans("role.$i");
+                }, $roles);
+            }
+
+            $result['author'] = [
+                'id' => $user->id,
+                'firstname' => $user->firstname,
+                'middlename' => $user->middlename,
+                'lastname' => $user->lastname,
+                'roles' => $roles,
+            ];
+        }
+
+        return $this->sendResult($result);
+    }
+
+    protected function getResumeAuthor(array $filter)
+    {
+        $conditionsNotes = [];
+        $conditionsComments = [];
+        $query = db()->table(sprintf('%s as author_table', SitelliteUser::TABLE))
+            ->leftJoin(Notes::TABLE,
+                'author_table.id',
+                sprintf('%s.author', Notes::TABLE))
+            ->leftJoin(NotesComments::TABLE,
+                sprintf('%s.author_id', NotesComments::TABLE),
+                'author_table.id')
+            ->leftJoin(Notes::TABLE . ' as notes_for_comments',
+                sprintf('%s.note_id', NotesComments::TABLE),
+                'notes_for_comments.id');
+
+        if ($filter) {
+            if ($userId = $filter['author_id'] ?? false) {
+                $query->where(sprintf('%s.id', 'author_table'), $userId);
+            }
+            if ($roles = $filter['roles'] ?? false) {
+                //join'им для заметок
+                $query
+                    ->leftJoin(NoteRoleAuthor::TABLE, function (JoinClause $join) {
+                        $join->on(
+                            sprintf('%s.id', Notes::TABLE),
+                            sprintf('%s.related_id', NoteRoleAuthor::TABLE))
+                            ->where(sprintf('%s.type', NoteRoleAuthor::TABLE), NoteRoleAuthor::NOTE_TYPE);
+                    });
+                //join'им для комментов
+                $query->leftJoin(NoteRoleAuthor::TABLE . ' as note_role_for_comments', function (JoinClause $join) {
+                    $join->on(
+                        'notes_for_comments.id',
+                        'note_role_for_comments.related_id')
+                        ->where('note_role_for_comments.type', NoteRoleAuthor::COMMENT_TYPE);
+                });
+
+                //добавляем условия для подсчета
+                $rolesImploded = sprintf('"%s"', array_shift($roles));
+                foreach ($roles as $r) {
+                    $rolesImploded .= sprintf(',"%s"', $r);
+                }
+
+                $conditionsNotes[] = sprintf('%s.role in (%s)', NoteRoleAuthor::TABLE, $rolesImploded);
+                $conditionsComments[] = sprintf('%s.role in (%s)', 'note_role_for_comments', $rolesImploded);
+
+            }
+            if ($class = $filter['class'] ?? false) {
+                $j = new Journal();
+                $studentsForFilter = array_keys($j->getStudentList($class['name'], $class['dep']));
+                $studentsImploded = implode(',', $studentsForFilter);
+                //добавляем условия для подсчета
+                $conditionsNotes[] = sprintf('%s.student_id in (%s)', Notes::TABLE, $studentsImploded);
+                $conditionsComments[] = sprintf('%s.student_id in (%s)', 'notes_for_comments', $studentsImploded);
+            }
+            if ($studentId = $filter['student_id'] ?? false) {
+                //добавляем условия для подсчета
+                $conditionsNotes[] = sprintf('%s.student_id = %s', Notes::TABLE, $studentId);
+                $conditionsComments[] = sprintf('%s.student_id = %s', 'notes_for_comments', $studentId);
+            }
+            if ($createdAtStart = $filter['created_at_start'] ?? false) {
+                $createdAtStart = Carbon::parse($createdAtStart)->format('Y-m-d');
+                $conditionsNotes[] = sprintf('%s.created_at >= "%s"', Notes::TABLE, $createdAtStart);
+                $conditionsComments[] = sprintf('%s.created_at >= "%s"', 'notes_for_comments', $createdAtStart);
+            }
+            if ($createdAtEnd = $filter['created_at_end'] ?? false) {
+                $createdAtEnd = Carbon::parse($createdAtEnd);
+                $createdAtEnd = $createdAtEnd->endOfDay()->format('Y-m-d H:i:s');
+                $conditionsNotes[] = sprintf('%s.created_at <= "%s"', Notes::TABLE, $createdAtEnd);
+                $conditionsComments[] = sprintf('%s.created_at <= "%s"', 'notes_for_comments', $createdAtEnd);
+            }
+            if ($typeNote = $filter['type_note_id'] ?? false) {
+                $conditionsNotes[] = sprintf('%s.type_note_id = %s', Notes::TABLE, $typeNote);
+                $conditionsComments[] = sprintf('%s.type_note_id = %s', 'notes_for_comments', $typeNote);
+            }
+            if ($tags = $filter['tags'] ?? false) {
+
+                $notesIdsWithTags = db()->table('note_tag')
+                    ->whereIn('note_tag.tag_id', $tags)
+                    ->pluck('note_id')
+                    ->toArray();
+                $notesIdsWithTagsImploded = implode(', ', $notesIdsWithTags);
+                $conditionsNotes [] = sprintf('%s.id in (%s)', Notes::TABLE, $notesIdsWithTagsImploded);
+                $conditionsComments [] = sprintf('%s.id in (%s)', 'notes_for_comments', $notesIdsWithTagsImploded);
+            }
+        }
+
+        if ($conditionsNotes) {
+            $conditionsNotes = implode(' and ', $conditionsNotes);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as notes_total',
+                    $conditionsNotes,
+                    Notes::TABLE))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as notes_total', Notes::TABLE)));
+        }
+
+        if ($conditionsComments) {
+            $conditionsComments = implode(' and ', $conditionsComments);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as comments_total',
+                    $conditionsComments,
+                    'notes_comments'))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as comments_total', 'notes_comments')));
+        }
+
+        return $query->first();
+    }
+
+    protected function getResumeStudent(array $filter)
+    {
+        $conditionsNotes = [];
+        $conditionsComments = [];
+        $query = db()->table(sprintf('%s as student_table', SitelliteUser::TABLE))
+            ->leftJoin(Notes::TABLE,
+                'student_table.id',
+                sprintf('%s.student_id', Notes::TABLE))
+            ->leftJoin(NotesComments::TABLE,
+                sprintf('%s.student_id', NotesComments::TABLE),
+                'student_table.id')
+            ->leftJoin(Notes::TABLE . ' as notes_for_comments',
+                sprintf('%s.note_id', NotesComments::TABLE),
+                'notes_for_comments.id');
+
+        if ($filter) {
+            if ($authorId = $filter['author_id'] ?? false) {
+                $conditionsNotes[] = sprintf('%s.author = %s', Notes::TABLE, $authorId);
+                $conditionsComments[] = sprintf('%s.author_id = %s', NotesComments::TABLE, $authorId);
+            }
+            if ($roles = $filter['roles'] ?? false) {
+                //join'им для заметок
+                $query
+                    ->leftJoin(NoteRoleAuthor::TABLE, function (JoinClause $join) {
+                        $join->on(
+                            sprintf('%s.id', Notes::TABLE),
+                            sprintf('%s.related_id', NoteRoleAuthor::TABLE))
+                            ->where(sprintf('%s.type', NoteRoleAuthor::TABLE), NoteRoleAuthor::NOTE_TYPE);
+                    });
+                //join'им для комментов
+                $query->leftJoin(NoteRoleAuthor::TABLE . ' as note_role_for_comments', function (JoinClause $join) {
+                    $join->on(
+                        'notes_for_comments.id',
+                        'note_role_for_comments.related_id')
+                        ->where('note_role_for_comments.type', NoteRoleAuthor::COMMENT_TYPE);
+                });
+
+                //добавляем условия для подсчета
+                $rolesImploded = sprintf('"%s"', array_shift($roles));
+                foreach ($roles as $r) {
+                    $rolesImploded .= sprintf(',"%s"', $r);
+                }
+
+                $conditionsNotes[] = sprintf('%s.role in (%s)', NoteRoleAuthor::TABLE, $rolesImploded);
+                $conditionsComments[] = sprintf('%s.role in (%s)', 'note_role_for_comments', $rolesImploded);
+
+            }
+            if ($class = $filter['class'] ?? false) {
+                //whereIn id
+                $j = new Journal();
+                $studentsForFilter = array_keys($j->getStudentList($class['name'], $class['dep']));
+                $query->whereIn('student_table.id', $studentsForFilter);
+            }
+            if ($studentId = $filter['student_id'] ?? false) {
+                $query->where('student_table.id', $studentId);
+            }
+            if ($createdAtStart = $filter['created_at_start'] ?? false) {
+                $createdAtStart = Carbon::parse($createdAtStart)->format('Y-m-d');
+                $conditionsNotes[] = sprintf('%s.created_at >= "%s"', Notes::TABLE, $createdAtStart);
+                $conditionsComments[] = sprintf('%s.created_at >= "%s"', 'notes_for_comments', $createdAtStart);
+            }
+            if ($createdAtEnd = $filter['created_at_end'] ?? false) {
+                $createdAtEnd = Carbon::parse($createdAtEnd);
+                $createdAtEnd = $createdAtEnd->endOfDay()->format('Y-m-d H:i:s');
+                $conditionsNotes[] = sprintf('%s.created_at <= "%s"', Notes::TABLE, $createdAtEnd);
+                $conditionsComments[] = sprintf('%s.created_at <= "%s"', 'notes_for_comments', $createdAtEnd);
+            }
+            if ($typeNote = $filter['type_note_id'] ?? false) {
+                $conditionsNotes[] = sprintf('%s.type_note_id = %s', Notes::TABLE, $typeNote);
+                $conditionsComments[] = sprintf('%s.type_note_id = %s', 'notes_for_comments', $typeNote);
+            }
+            if ($tags = $filter['tags'] ?? false) {
+
+                $notesIdsWithTags = db()->table('note_tag')
+                    ->whereIn('note_tag.tag_id', $tags)
+                    ->pluck('note_id')
+                    ->toArray();
+                $notesIdsWithTagsImploded = implode(', ', $notesIdsWithTags);
+                $conditionsNotes [] = sprintf('%s.id in (%s)', Notes::TABLE, $notesIdsWithTagsImploded);
+                $conditionsComments [] = sprintf('%s.id in (%s)', 'notes_for_comments', $notesIdsWithTagsImploded);
+            }
+        }
+
+        if ($conditionsNotes) {
+            $conditionsNotes = implode(' and ', $conditionsNotes);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as notes_total',
+                    $conditionsNotes,
+                    Notes::TABLE))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as notes_total', Notes::TABLE)));
+        }
+
+        if ($conditionsComments) {
+            $conditionsComments = implode(' and ', $conditionsComments);
+            $query->addSelect(db()->raw(
+                sprintf('COUNT(distinct if (%s,%s.id, null)) as comments_total',
+                    $conditionsComments,
+                    'notes_comments'))
+            );
+        } else {
+            $query->addSelect(db()->raw(sprintf('COUNT(distinct %s.id) as comments_total', 'notes_comments')));
+        }
+        return $query->first();
+    }
+}
