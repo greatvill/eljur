@@ -1,0 +1,244 @@
+<?php
+
+use App\Data\Journal\Models\JournalHometask;
+use App\Data\Load\Models\JournalSchedule;
+use App\System\Export\Statistics\Factory;
+use GuzzleHttp\Exception\GuzzleException;
+use Illuminate\Support\Carbon;
+
+class ReportImplementProgressCommand extends ReportCommand
+{
+    public const TYPE_REPORT = 'implement_progress';
+
+    /**
+     * @throws GuzzleException
+     */
+    public function run(): void
+    {
+        $year = DomainYear::getStudyYearByDate(date('Y-m-d'));
+        $startDate = $year->getStartDate();
+        $endDate = $year->getEndDate();
+        $startActivityDate = Carbon::createFromFormat('Y-m-d', $year->getStartDate())->subMonth()->format('Y-m-d');
+        /**begin Студенты **/
+        $students = db()->select(
+            'SELECT count(DISTINCT u.id) as t, count(DISTINCT a.username) as active
+                FROM sitellite_user as u
+                         JOIN journal_transition as tr1 on u.id=tr1.username
+                         LEFT JOIN journal_transition as tr2 on tr1.username=tr2.username 
+                        AND (tr1.date<tr2.date OR tr1.date=tr2.date AND tr1.id<tr2.id) AND tr2.type IN (\'class\',\'dropout\')
+                         LEFT JOIN journal_activity as a on u.id=a.username AND a.date BETWEEN :startActivity AND :endDate
+                WHERE tr1.type IN (\'arrival\',\'move\',\'class\') 
+                  AND tr1.date BETWEEN :startDate AND :endDate AND tr1.new NOT RLIKE "^(Н|С|Д)[0-9]*" 
+                  AND tr2.id IS NULL AND u.password!="removed"', [
+            'startActivity' => $startActivityDate,
+            'startDate' => $startDate,
+            'endDate' => $endDate,
+        ]);
+
+        ['t' => $studentsTotal, 'active' => $studentsActivity] = (array)$students[0];
+        $studentsActivity = $studentsTotal > 0 ? (int)round($studentsActivity / $studentsTotal * 100) : 0;
+        $studentsTotal = (int)$studentsTotal;
+        /**end студенты **/
+
+        /**begin classes **/
+        $classesTotal = \App\Data\Journal\Models\JournalClass::query()
+            ->where('year', $year->getString())
+            ->where('uid', 0)
+            ->count();
+        $classesWithSchedulesTotal = JournalSchedule::query()
+            ->distinct()
+            ->where('year', $year->getString())
+            ->where('class', 'NOT RLIKE', '^(Н|С|Д)[0-9]*')
+            ->count('class');
+
+        $classesWithSchedule = $classesTotal > 0 ? (int)round(100 * $classesWithSchedulesTotal / $classesTotal) : 0;
+        /**end classes **/
+
+        /**employees begin **/
+        $employees = db()->select(
+            'select count(DISTINCT ut.id) as t, sum(IF(ut.snils IS NULL,0,1)) as snils,sum(IF(ut.username IS NULL,0,1)) as active
+	from (
+		select DISTINCT u.* FROM sitellite_user as u 
+	left join journal_add_role as r on u.id=r.username
+		left join (
+			SELECT distinct username from journal_activity where `action`="login" AND date>=?
+			) as a on u.id=a.username
+	where (u.role NOT IN ("parent","student","helper","siteconnector","") OR r.role NOT IN ("parent","student","helper","siteconnector","")) AND u.username NOT LIKE "sysadmin%" AND u.username NOT LIKE "\_%" AND u.password!="removed"
+	) as ut', [$year->getStartDate()]);
+        ['t' => $employeesTotal, 'active' => $employeesActivity, 'snils' => $employeesSnils] = (array)$employees[0];
+        $employeesSnils = (int)round($employeesSnils / $employeesTotal * 100);
+        $employeesActivity = (int)round($employeesActivity / $employeesTotal * 100);
+        $employeesTotal = (int)$employeesTotal;
+        /**end employees **/
+
+        /**begin teachers **/
+        $teachers = db()->select(
+            'select count(DISTINCT ut.id) as t, sum(IF(ut.snils IS NULL,0,1)) as snils, sum(IF(ut.username IS NULL,0,1)) as active
+            from (
+                select DISTINCT u.* FROM sitellite_user as u 
+                left join journal_add_role as r on u.id=r.username
+                left join (
+                    SELECT distinct username from journal_activity where `action`="login" AND date>=?
+                ) as a on u.id=a.username
+                where (u.role IN ("teacher") OR r.role IN ("teacher")) AND u.username NOT LIKE "sysadmin%" AND u.username NOT LIKE "\_%" AND u.password!="removed"
+            ) as ut', [$startActivityDate]);
+
+        ['t' => $teachersTotal, 'active' => $teachersActivity, 'snils' => $teachersSnils] = (array)$teachers[0];
+        $teachersActivity = (int)round($teachersActivity / $teachersTotal * 100);
+        $teachersSnils = (int)round($teachersSnils / $teachersTotal * 100);
+        $teachersTotal = (int)$teachersTotal;
+        /**end teachers **/
+
+        /**
+         * begin parents
+         */
+        $parents = db()->select(
+            'SELECT count(DISTINCT p.id) as t, count(DISTINCT IF(p.snils IS NULL,NULL,p.id)) as snils, count(DISTINCT a.username) as active
+                FROM journal_transition as tr1 
+                LEFT JOIN journal_transition as tr2 on tr1.username=tr2.username 
+                   AND (tr1.date<tr2.date OR tr1.date=tr2.date AND tr1.id<tr2.id) AND tr2.type IN (\'class\',\'dropout\')
+                LEFT JOIN sch_family_member as stf on stf.uid=tr1.username
+                LEFT JOIN sch_family_member as pf on pf.family_id=stf.family_id and pf.role="parent"
+                LEFT JOIN sitellite_user as p on pf.uid=p.id
+                LEFT JOIN journal_activity as a on p.id=a.username AND a.date BETWEEN :startActivity AND :endDate
+                WHERE tr1.type IN (\'arrival\',\'move\',\'class\') AND tr1.date BETWEEN :startDate AND :endDate 
+                  AND tr1.new NOT RLIKE "^(Н|С|Д)[0-9]*" AND tr2.id IS NULL 
+                  AND p.password!="removed"',
+            [
+                'startActivity' => $startActivityDate,
+                'startDate' => $startDate,
+                'endDate' => $endDate,
+            ]);
+
+        ['t' => $parentsTotal, 'active' => $parentsActivity, 'snils' => $parentsSnils] = (array)$parents[0];
+        $parentsActivity = $parentsTotal > 0 ? (int)round($parentsActivity / $parentsTotal * 100) : 0;
+        $parentsSnils = $parentsTotal > 0 ? (int)round($parentsSnils / $parentsTotal * 100) : 0;
+        $parentsTotal = (int)$parentsTotal;
+        /**
+         * end parents
+         */
+
+        /**
+         * begin family
+         */
+        $family = db()->select(
+            'select count(DISTINCT family_id) as t, sum(IF(scount>0,1,0)) as snils
+        from (
+        SELECT pf.family_id, count(p.snils) as scount
+        FROM journal_transition as tr1
+        LEFT JOIN journal_transition as tr2 on tr1.username=tr2.username 
+           AND (tr1.date<tr2.date OR tr1.date=tr2.date AND tr1.id<tr2.id) AND tr2.type IN (\'class\',\'dropout\')
+        LEFT JOIN sch_family_member as stf on stf.uid=tr1.username
+        LEFT JOIN sch_family_member as pf on pf.family_id=stf.family_id and pf.role="parent"
+        LEFT JOIN sitellite_user as p on pf.uid=p.id
+        WHERE tr1.type IN (\'arrival\',\'move\',\'class\') AND tr1.date BETWEEN :startDate AND :endDate 
+          AND tr1.new NOT RLIKE "^(Н|С|Д)[0-9]*" and tr2.id IS NULL AND p.password!="removed"
+        group by pf.family_id
+        ) as f',
+            [
+                'startDate' => $startDate,
+                'endDate' => $endDate,
+            ]);
+
+        ['t' => $familyTotal, 'snils' => $familySnils] = (array)$family[0];
+        $familySnils = $familyTotal > 0 ? (int)round($familySnils / $familyTotal * 100) : 0;
+        /**
+         * end family
+         */
+
+        /**
+         * begin hometask
+         */
+        $hometaskTotal = JournalHometask::query()
+            ->where('date', '>=', $startDate)
+            ->count();
+
+        $hometaskLink = JournalHometask::query()
+            ->where(sprintf('%s.date', JournalHometask::TABLE), '>=', $startDate)
+            ->join(
+                'journal_hometask_resource as hr',
+                'hr.hometask_id',
+                sprintf('%s.id', JournalHometask::TABLE)
+            )
+            ->join(
+                'resources_collection as r',
+                'r.id',
+                'hr.resource_id'
+            )
+            ->where('r.section', '=', 'education')
+            ->where('r.type', '=', 'link')
+            ->count(db()->raw('distinct ' . sprintf('%s.id', JournalHometask::TABLE)));
+
+        $hometaskLink = $hometaskTotal > 0 ? (int)round($hometaskLink / $hometaskTotal * 100) : 0 ;
+        /**
+         * end hometask
+         */
+
+        /**
+         * начало рейтинг НАСТРОЙКА
+         */
+        $load = \App\Data\Journal\Models\JournalLoad::query()
+            ->where('year', $year->getString())->count();
+        $ratingSetting = (($classesTotal ? 1 : 0)
+                + ($studentsTotal ? 1 : 0)
+                + ($studentsTotal > 3 ? 1 : 0)
+                + ($load > 30 ? 1 : 0)
+                + ($classesWithSchedule ? 1 : 0)
+                + ($classesWithSchedule > 50 ? 1 : 0)
+                + ($classesWithSchedule >= 100 ? 1 : 0)) / 7 * 100;
+        $ratingSetting = (int)round($ratingSetting);
+        /**
+         * конец рейтинг НАСТРОЙКА
+         */
+
+        /**
+         * начало рейтинг АКТИВНОСТЬ
+         */
+        $ratingActive = ($teachersActivity + $studentsActivity + $parentsActivity) / 3;
+        $ratingActive = (int)round($ratingActive);
+        /**
+         * конец рейтинг АКТИВНОСТЬ
+         */
+
+        /**
+         * начало рейтинг СНИЛС
+         */
+        $ratingSnils = ($teachersSnils + $parentsSnils + $familySnils) / 3;
+        $ratingSnils = (int)round($ratingSnils);
+        /**
+         * конец рейтинг СНИЛС
+         */
+        $data = [
+            'classes_total' => $classesTotal,
+            'students_total' => $studentsTotal,
+            'employees_total' => $employeesTotal,
+            'employees_activity' => $employeesActivity,
+            'employees_snils' => $employeesSnils,
+            'teachers_total' => $teachersTotal,
+            'teachers_activity' => $teachersActivity,
+            'teachers_snils' => $teachersSnils,
+            'load' => $load,
+            'classes_with_schedule' => $classesWithSchedule,
+            'students_activity' => $studentsActivity,
+            'parents_total' => $parentsTotal,
+            'parents_activity' => $parentsActivity,
+            'parents_snils' => $parentsSnils,
+            'family_snils' => $familySnils,
+            'hometasks_link' => $hometaskLink,
+            'rating_setting' => $ratingSetting,
+            'rating_active' => $ratingActive,
+            'rating_snils' => $ratingSnils,
+            'lessons_with_hometasks' => 0,
+        ];
+
+        $report = Factory::getReport();
+        $year = DomainYear::getStudyYearByDate(date('Y-m-d'))->getString();
+        $report->setSchoolDomain(curDomain())
+            ->setStudyYear($year)
+            ->setType(self::TYPE_REPORT)
+            ->setDate(new DateTime())
+            ->setData($data);
+
+        $this->exporter->sendReport($report);
+    }
+}
