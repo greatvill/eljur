@@ -1,0 +1,1312 @@
+<?php
+
+use App\Data\Olympiads\Models\Olympiad;
+use App\Data\Olympiads\Models\OlympiadCode;
+use App\Data\Olympiads\Models\OlympiadParticipant;
+use App\Data\Olympiads\Models\OlympiadRegulation;
+use App\Data\Olympiads\Models\OlympiadSchedule;
+use App\Data\Olympiads\Models\OlympiadSubject;
+use App\Data\Olympiads\Services\OlympiadPortfolio;
+use App\Data\User\Models\SitelliteUser;
+use App\Events\Olympiad\OlympiadResult;
+use App\Olympiad\Events\OlympiadSignUp;
+use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Http\Request;
+use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Arr;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Validation\Rule;
+use PhpOffice\PhpSpreadsheet\Spreadsheet;
+
+class OlympiadController extends EljurApiController
+{
+    private $subjects;
+    private $exitsCodes;
+
+    public function actionSaveOlympiad(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'id' => 'int',
+            'subject_id' => 'int|required',
+            'started_at' => 'date|required',
+            'deadline_submission' => 'date|before_or_equal:started_at',
+            'parallel_min' => 'int|required|lte:parallel_max',
+            'parallel_max' => 'int|required',
+            'platform' => Rule::in(['sirius']), // TODO если не указано - какое значение?
+            'format' => Rule::in(['intramural', 'extramural']),
+        ]);
+
+        if (!empty($data['id'])) {
+            $olympiad = Olympiad::query()->findOrFail($data['id']);
+            unset($data['id']);
+        } else {
+            $olympiad = new Olympiad();
+        }
+        $olympiad->fill($data);
+        $olympiad->save();
+        return $this->sendResult($olympiad->only(['id']));
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function actionDeleteOlympiad(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'id' => 'int|required',
+        ]);
+        /**
+         * @var Olympiad $olympiad
+         */
+        $olympiad = Olympiad::query()->findOrFail($data['id']);
+        $codeIds = $olympiad->participants->pluck('active_code_id')->toArray();
+
+        OlympiadCode::query()
+            ->whereIn('id', $codeIds)
+            ->update([
+                'status' => OlympiadCode::CODE_FREE,
+                'participant_id' => null,
+            ]);
+
+        $olympiad->participants()->delete();
+        $olympiad->delete();
+        return $this->sendResult();
+    }
+
+    public function actionListOlympiad(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'perPage' => 'int|max:100',
+            'view' => Rule::in(['parent', 'student', 'administrator']),
+            'student_id' => 'int',
+            'filter' => 'array',
+        ]);
+        $view = $data['view'] ?? 'administrator';
+        $perPage = $data['perPage'] ?? 10;
+        $filter = $data['filter'] ?? [];
+        if ($view === 'parent') {
+            $children = SParent::getChildren();
+            if (isset($data['student_id'])) {
+                if (isset($children[$data['student_id']])) {
+                    $parallel = getParallel($children[$data['student_id']]);
+                }
+            } else {
+                foreach ($children as $class) {
+                    if (!isset($parallel)) {
+                        $parallel = getParallel($class);
+                    }
+                    $parallel = min(getParallel($class), $parallel);
+                }
+            }
+
+            if (!empty($parallel)) {
+                $paginator = $this->getPaginatorByParallel($parallel, $perPage);
+            }
+
+        } elseif ($view === 'student') {
+            $user = session_get_user_model();
+            if ($user) {
+                $class = $this->getClass($user);
+            }
+            $participations = OlympiadParticipant::query()
+                ->where('student_id', $user->id)
+                ->pluck('olympiad_id');
+
+            if (isset($class) && $parallel = getParallel($class)) {
+                $paginator = $this->getPaginatorByParallel($parallel, $perPage);
+                $paginator->transform(function (Olympiad $olympiad) use ($participations) {
+                    $olympiad->has_participation = $participations->contains($olympiad->id);
+                    return $olympiad->append('can_participate');
+                });
+            }
+
+        } else {
+            /**
+             * @var Illuminate\Pagination\LengthAwarePaginator $paginator
+             */
+            $query = Olympiad::query()
+                ->with([
+                    'schedules' => function (HasMany $query) {
+                        $query->select([
+                            'id',
+                            'place',
+                            'time_from',
+                            'time_to',
+                            'note',
+                            'olympiad_id'
+                        ]);
+                    },
+                    'subject' => function (BelongsTo $query) {
+                        $query->select('name', 'id');
+                    }])
+                ->select([
+                    'id',
+                    'subject_id',
+                    'started_at',
+                    'parallel_min',
+                    'parallel_max',
+                    'platform',
+                    'deadline_submission',
+                    'format',
+                ]);
+
+            if ($filter['year']) {
+                $years = Core::getYears();
+                if (isset($years[$filter['year']])) {
+                    ['start' => $start, 'end' => $end] = $years[$filter['year']];
+                    $query->where('created_at', '>=', $start)
+                        ->where('created_at', '<=', $end);
+                }
+            }
+            $paginator = $query->paginate($data['perPage'] ?? 10);
+        }
+
+        return $this->sendResult($paginator ?? null);
+    }
+
+    public function actionYears(): EljurRawResponse
+    {
+        return $this->sendResult(array_keys(Core::getYears()));
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function actionSaveSchedule(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'id' => 'int',
+            'time_from' => 'date_format:H:i',
+            'time_to' => 'date_format:H:i',
+            'note' => 'string',
+            'place' => 'string',
+            'olympiad_id' => 'int|required',
+        ]);
+        $isEmpty = collect($data)->reject(static function ($item, $key) {
+            return in_array($key, ['id', 'olympiad_id']);
+        })->isEmpty();
+        if ($isEmpty) {
+            throw new Exception(trans('olympiads.errors.empty_attrs'));
+        }
+        if (!empty($data['id'])) {
+            $olympiadSchedule = OlympiadSchedule::query()->findOrFail($data['id']);
+            unset($data['id']);
+        } else {
+            $olympiadSchedule = new OlympiadSchedule();
+        }
+        $olympiadSchedule->fill($data);
+        $olympiadSchedule->save();
+        return $this->sendResult($olympiadSchedule->only(['id']));
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function actionDeleteSchedule(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'id' => 'int|required',
+        ]);
+        $olympiad = OlympiadSchedule::query()->findOrFail($data['id']);
+        $olympiad->delete();
+        return $this->sendResult();
+    }
+
+    private function getPaginatorByParallel(int $parallel, int $perPage = 10): LengthAwarePaginator
+    {
+        $query = Olympiad::query()
+            ->with([
+                'subject' => function (BelongsTo $query) {
+                    $query->select('name', 'id');
+                }])
+            ->select([
+                'id',
+                'subject_id',
+                'started_at',
+                'parallel_min',
+                'parallel_max',
+                'platform',
+                'deadline_submission',
+                'format',
+            ]);
+
+        $query->where('parallel_max', '>=', $parallel);
+
+        return $query->paginate($perPage);
+    }
+
+    public function actionListSubjects(): EljurRawResponse
+    {
+        return $this->sendResult(OlympiadSubject::all('id', 'name'));
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function actionSignUp(Request $request): EljurRawResponse
+    {
+        $student = session_get_user_model();
+        if (!($student && ($class = $this->getClass($student)) && $parallel = getParallel($class))) {
+            throw new Exception('parallel_not_found');
+        }
+        $data = $request->validate([
+            'parallel' => 'int|required|min:' . $parallel,
+            'olympiad_id' => 'int|required'
+        ]);
+        /**
+         * @var Olympiad $olympiad
+         */
+        if (OlympiadParticipant::query()->where([
+            'student_id' => $student->id,
+            'olympiad_id' => $data['olympiad_id']
+        ])->exists()) {
+            throw new Exception(trans('olympiads.errors.sign_up_again'));
+        }
+        $olympiad = Olympiad::query()->findOrFail($data['olympiad_id']);
+        if (!$olympiad->can_participate) {
+            throw new Exception(trans('olympiads.errors.deadline_expired'));
+        }
+        if (!($data['parallel'] >= $olympiad->parallel_min && $data['parallel'] <= $olympiad->parallel_max)) {
+            throw new Exception(trans('olympiads.errors.parallel_out'));
+        }
+        $participant = new OlympiadParticipant();
+        $participant->fill($data + ['student_id' => $student->id]);
+        $participant->save();
+        event((new OlympiadSignUp($participant)));
+        return $this->sendResult();
+    }
+
+    /**
+     * @param Request $request
+     * @return EljurRawResponse
+     * Список участников для учителя
+     */
+    public function actionListParticipantsForTeacher(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'sort' => 'array',
+            'sort.*' => 'in:desc,asc',
+            'perPage' => 'int',
+            'filter' => 'array',
+        ]);
+        $sort = $data['sort'] ?? [];
+        $filter = $data['filter'] ?? [];
+        $perPage = $data['perPage'] ?? 10;
+        $dataBaseOfSubject = (new OlympiadSubject)->getConnection()->getDatabaseName();
+
+        $query = DB::table('olympiad_participants')
+            ->select([
+                sprintf('%s.id', OlympiadParticipant::TABLE),
+                sprintf('%s.id as student_id', SitelliteUser::TABLE),
+                sprintf('%s.lastname', SitelliteUser::TABLE),
+                sprintf('%s.firstname', SitelliteUser::TABLE),
+                sprintf('%s.middlename', SitelliteUser::TABLE),
+                sprintf('%s.started_at', Olympiad::TABLE),
+                sprintf('%s.name as subject', OlympiadSubject::TABLE),
+                sprintf('%s.id as olympiad_id', Olympiad::TABLE),
+                sprintf('%s.time_from', OlympiadSchedule::TABLE),
+                sprintf('%s.time_to', OlympiadSchedule::TABLE),
+                sprintf('%s.place', OlympiadSchedule::TABLE),
+                sprintf('%s.is_confirmed', OlympiadParticipant::TABLE),
+                sprintf('%s.sum_points', OlympiadParticipant::TABLE),
+                sprintf('%s.result', OlympiadParticipant::TABLE),
+
+            ])
+            ->leftJoin(
+                Olympiad::TABLE,
+                sprintf('%s.id', Olympiad::TABLE),
+                sprintf('%s.olympiad_id', OlympiadParticipant::TABLE)
+            )
+            ->rightJoin(
+                SitelliteUser::TABLE,
+                sprintf('%s.id', SitelliteUser::TABLE),
+                sprintf('%s.student_id', OlympiadParticipant::TABLE)
+            )
+            ->leftJoin(
+                sprintf('%s.%s', $dataBaseOfSubject, OlympiadSubject::TABLE),
+                sprintf('%s.id', OlympiadSubject::TABLE),
+                sprintf('%s.subject_id', Olympiad::TABLE)
+            )
+            ->leftJoin(
+                OlympiadSchedule::TABLE,
+                sprintf('%s.id', OlympiadSchedule::TABLE),
+                sprintf('%s.schedule_id', OlympiadParticipant::TABLE)
+            );
+
+        if (isset($filter['class'])) {
+            $j = new Journal();
+            $students = $j->getStudentList($filter['class']);
+        } else {
+            $journalUser = new journalUser('student');
+            $students = $journalUser->getList(false, false, 'lastname', 'asc', []);
+        }
+        $stIds = array_keys($students);
+        $query = $query->whereIn(sprintf('%s.id', SitelliteUser::TABLE), $stIds);
+
+        $direction = $sort['student'] ?? 'asc';
+        $query->orderBy(sprintf('%s.lastname', SitelliteUser::TABLE), $direction)
+            ->orderBy(sprintf('%s.firstname', SitelliteUser::TABLE), $direction)
+            ->orderBy(sprintf('%s.middlename', SitelliteUser::TABLE), $direction);
+
+        /**
+         * @var LengthAwarePaginator $paginator
+         */
+        $paginator = $query->paginate($perPage);
+        $res = [];
+        $paginator->map(function ($item) use (&$res) {
+            $item = (array)$item;
+            $keyResItem = $item['student_id'];
+            if (!isset($res[$keyResItem])) {
+                $keys = [
+                    'student_id',
+                    'lastname',
+                    'firstname',
+                    'middlename',
+                ];
+                $res[$keyResItem] = Arr::only($item, $keys);
+            }
+            $olympiad = Arr::only($item, [
+                'subject',
+                'started_at',
+                'olympiad_id',
+                'time_from',
+                'time_to',
+                'place'
+            ]);
+            if ($olympiad['time_from'] && $olympiad['time_to']) {
+                $olympiad['time_from'] = Carbon::parse($item['time_from'])->format('H:i');
+                $olympiad['time_to'] = Carbon::parse($item['time_to'])->format('H:i');
+            }
+            $olympiad['is_confirmed'] = (bool)$item['is_confirmed'];
+            $olympiad['sum_points'] = (float)$item['sum_points'];
+            $olympiad['result'] = OlympiadParticipant::getResultNames()[$item['result']] ?? null;
+            if (array_filter($olympiad)) {
+                $res[$keyResItem]['olympiads'][] = $olympiad;
+            }
+        });
+        $collection = collect(array_values($res))
+            ->map(function ($item) {
+                if (isset($item['olympiads'])) {
+                    $item['olympiads'] = collect($item['olympiads'])->sortBy(function ($olympiad) {
+                        return Carbon::parse($olympiad['started_at'])->unix();
+                    }, SORT_NUMERIC)->values();
+                }
+                return $item;
+            });
+        $paginator = $paginator->setCollection($collection);
+        return $this->sendResult($paginator);
+
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function actionListDistribution(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'sort' => 'array',
+            'sort.*' => 'in:desc,asc',
+            'filter' => 'array|required',
+        ]);
+        $filter = $data['filter'] ?? [];
+        $sort = $data['sort'] ?? ['student' => 'asc'];
+        if (empty($filter['subject_id']) || !is_numeric($filter['subject_id'])) {
+            throw new Exception(trans('olympiads.errors.subject_is_empty'));
+        }
+        $transCacheFacade = Core::getTransitionCacheFacade();
+        $query = DB::table('olympiad_participants')
+            ->select([
+                sprintf('%s.id', OlympiadParticipant::TABLE),
+                sprintf('%s.student_id', OlympiadParticipant::TABLE),
+                sprintf('%s.olympiad_id', OlympiadParticipant::TABLE),
+                sprintf('%s.schedule_id', OlympiadParticipant::TABLE),
+            ])
+            ->leftJoin(
+                Olympiad::TABLE,
+                sprintf('%s.id', Olympiad::TABLE),
+                sprintf('%s.olympiad_id', OlympiadParticipant::TABLE)
+            )
+            ->where(sprintf('%s.subject_id', Olympiad::TABLE), $filter['subject_id']);
+        if (isset($filter['min_parallel'])) {
+            $query->where('parallel', '>=', $filter['min_parallel']);
+        }
+        if (isset($filter['max_parallel'])) {
+            $query->where('parallel', '<=', $filter['max_parallel']);
+        }
+        $olympiadParticipants = $query->get();
+        $olympiadIds = $olympiadParticipants->pluck('olympiad_id');
+        $stIds = $olympiadParticipants->pluck('student_id')->toArray();
+        $transCacheFacade->getForUsernames($stIds);
+        $queryStudents = SitelliteUser::query()
+            ->select([
+                sprintf('%s.id', SitelliteUser::TABLE),
+                sprintf('%s.firstname', SitelliteUser::TABLE),
+                sprintf('%s.lastname', SitelliteUser::TABLE),
+                sprintf('%s.middlename', SitelliteUser::TABLE),
+                'tr.class',
+            ])
+            ->whereIn('id', $stIds);
+
+        if (isset($sort['student'])) {
+            $queryStudents->orderBy(sprintf('%s.lastname', SitelliteUser::TABLE), $sort['student'])
+                ->orderBy(sprintf('%s.firstname', SitelliteUser::TABLE), $sort['student']);
+        }
+
+        $year = DomainYear::getStudyYearByDate(date('Y-m-d'))->getString();
+        $yearStart = substr($year, 0, 4) . '-09-01';
+        $yearEnd = substr($year, 5) . '-08-31';
+        $queryStudents->leftJoinSub("SELECT tr1.username, tr1.new as class FROM journal_transition as tr1
+            LEFT JOIN journal_transition as tr2 ON tr1.username=tr2.username 
+                AND tr2.type IN (\"move\",\"class\",\"dropout\") 
+                AND (tr2.new IS NULL OR tr2.new NOT REGEXP(\"^(Н|С|Д)[0-9]+\")) 
+                AND (tr2.old IS NULL OR tr2.old NOT REGEXP(\"^(Н|С|Д)[0-9]+\")) 
+                AND tr1.date <= tr2.date 
+                AND tr1.new = tr2.old 
+                AND tr1.id != tr2.id
+                AND tr2.date BETWEEN  \"$yearStart \" AND  \"$yearEnd \"
+            WHERE tr1.type IN (\"arrival\",\"move\",\"class\") 
+                AND (tr1.new NOT REGEXP(\"^(Н|С|Д)[0-9]+\")) 
+                AND (tr1.old IS NULL OR tr1.old NOT REGEXP(\"^(Н|С|Д)[0-9]+\"))
+                AND tr2.id IS NULL AND tr1.date BETWEEN \"$yearStart \" AND  \"$yearEnd\"",
+            'tr', 'tr.username', sprintf('%s.id', SitelliteUser::TABLE));
+
+        $students = $queryStudents->get()->keyBy('id');
+        $olympiadParticipants = $olympiadParticipants->groupBy('student_id');
+        $studentsWithParticipation = [];
+
+        /**
+         * @var SitelliteUser $item
+         */
+        foreach ($students as $stId => $item) {
+            $studentsWithParticipation[] = [
+                'student_id' => $stId,
+                'firstname' => $item->firstname,
+                'lastname' => $item->lastname,
+                'middlename' => $item->middlename,
+                'student_full_name' => $item->full_name,
+                'class' => $item->class,
+                'participants' => $olympiadParticipants->get($stId)->map(function (object $p) {
+                    return [
+                        'olympiad_participants_id' => (int)$p->id,
+                        'olympiad_id' => (int)$p->olympiad_id,
+                        'schedule_id' => (int)$p->schedule_id,
+                    ];
+                })->toArray()
+            ];
+        }
+
+        $olympiads = Olympiad::query()
+            ->whereIn('id', $olympiadIds)
+            ->with(['schedules' => function ($query) {
+                $query->select(['id', 'place', 'note', 'time_from', 'olympiad_id']);
+            }])
+            ->select('id', 'format', 'started_at')
+            ->get();
+        return $this->sendResult(['students' => $studentsWithParticipation, 'olympiads' => $olympiads]);
+    }
+
+    /**
+     * @param Request $request
+     * @return EljurRawResponse
+     * Список участников для завуча
+     * @throws \PhpOffice\PhpSpreadsheet\Writer\Exception
+     */
+    public function actionListParticipants(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'sort' => 'array',
+            'sort.*' => 'in:desc,asc',
+            'filter' => 'array',
+            'perPage' => 'int',
+            'export' => 'boolean',
+        ]);
+        $perPage = $data['perPage'] ?? 10;
+        $filter = $data['filter'] ?? [];
+        $sort = $data['sort'] ?? [];
+        $dataBaseOfSubject = (new OlympiadSubject)->getConnection()->getDatabaseName();
+        $query = DB::table('olympiad_participants')
+            ->select([
+                sprintf('%s.id', OlympiadParticipant::TABLE),
+                sprintf('%s.student_id', OlympiadParticipant::TABLE),
+                sprintf('%s.parallel', OlympiadParticipant::TABLE),
+                sprintf('%s.lastname', SitelliteUser::TABLE),
+                sprintf('%s.firstname', SitelliteUser::TABLE),
+                sprintf('%s.middlename', SitelliteUser::TABLE),
+                sprintf('%s.id as subject_id', OlympiadSubject::TABLE),
+                sprintf('%s.name as subject', OlympiadSubject::TABLE),
+                sprintf('%s.started_at', Olympiad::TABLE),
+                sprintf('%s.time_from', OlympiadSchedule::TABLE),
+                sprintf('%s.time_to', OlympiadSchedule::TABLE),
+                sprintf('%s.place', OlympiadSchedule::TABLE),
+                sprintf('%s.code', OlympiadCode::TABLE),
+                sprintf('%s.result', OlympiadParticipant::TABLE),
+                sprintf('%s.sum_points', OlympiadParticipant::TABLE),
+                sprintf('%s.is_confirmed', OlympiadParticipant::TABLE),
+                'tr.class as class',
+            ])
+            ->leftJoin(
+                SitelliteUser::TABLE,
+                sprintf('%s.id', SitelliteUser::TABLE),
+                sprintf('%s.student_id', OlympiadParticipant::TABLE)
+            )
+            ->leftJoin(
+                Olympiad::TABLE,
+                sprintf('%s.id', Olympiad::TABLE),
+                sprintf('%s.olympiad_id', OlympiadParticipant::TABLE)
+            )
+            ->leftJoin(
+                OlympiadSchedule::TABLE,
+                sprintf('%s.id', OlympiadSchedule::TABLE),
+                sprintf('%s.schedule_id', OlympiadParticipant::TABLE)
+            )
+            ->leftJoin(
+                sprintf('%s.%s', $dataBaseOfSubject, OlympiadSubject::TABLE),
+                sprintf('%s.id', OlympiadSubject::TABLE),
+                sprintf('%s.subject_id', Olympiad::TABLE)
+            )
+            ->leftJoin(
+                OlympiadCode::TABLE,
+                sprintf('%s.id', OlympiadCode::TABLE),
+                sprintf('%s.active_code_id', OlympiadParticipant::TABLE)
+            );
+        $year = DomainYear::getStudyYearByDate(date('Y-m-d'))->getString();
+        $year_start = substr($year, 0, 4) . '-09-01';
+        $year_end = substr($year, 5) . '-08-31';
+        $query->leftJoinSub("SELECT tr1.username, tr1.new as class
+                                                    FROM journal_transition as tr1
+                                                    LEFT JOIN journal_transition as tr2 ON tr1.username=tr2.username AND tr2.type IN (\"move\",\"class\",\"dropout\") 
+                                                        AND (tr2.new IS NULL OR tr2.new NOT REGEXP(\"^(Н|С|Д)[0-9]+\")) AND (tr2.old IS NULL OR tr2.old NOT REGEXP(\"^(Н|С|Д)[0-9]+\")) AND tr1.date <= tr2.date AND tr1.new = tr2.old AND tr1.id != tr2.id
+                                                        AND tr2.date BETWEEN  \"$year_start \" AND  \"$year_end \"
+                                                    WHERE tr1.type IN (\"arrival\",\"move\",\"class\") 
+                                                     AND (tr1.new NOT REGEXP(\"^(Н|С|Д)[0-9]+\")) 
+                                                    AND (tr1.old IS NULL OR tr1.old NOT REGEXP(\"^(Н|С|Д)[0-9]+\"))
+                                                    AND tr2.id IS NULL AND tr1.date BETWEEN \"$year_start \" AND  \"$year_end\"",
+            'tr', 'tr.username', sprintf('%s.student_id', OlympiadParticipant::TABLE));
+
+        if (isset($filter['class'])) {
+            $students = $this->getStudentsByClass($filter['class']);
+            $studentIds = array_keys($students);
+            if (!$studentIds) {
+                return $this->sendResult([]);
+            }
+            $query->whereIn('student_id', $studentIds);
+        }
+        if (isset($filter['min_parallel'])) {
+            $query->where(sprintf('%s.parallel', OlympiadParticipant::TABLE), '>=', $filter['min_parallel']);
+        }
+        if (isset($filter['max_parallel'])) {
+            $query->where(sprintf('%s.parallel', OlympiadParticipant::TABLE), '<=', $filter['max_parallel']);
+        }
+        if (isset($filter['started_at'])) {
+            $query->where(sprintf('%s.started_at', Olympiad::TABLE), $filter['started_at']);
+        }
+        if (isset($filter['subject_id'])) {
+            $query->where(sprintf('%s.subject_id', Olympiad::TABLE), $filter['subject_id']);
+        }
+        if (isset($filter['year'])) {
+            $years = Core::getYears();
+            if (isset($years[$filter['year']])) {
+                ['start' => $start, 'end' => $end] = $years[$filter['year']];
+                $cratedAtColumn = sprintf('%s.created_at', OlympiadParticipant::TABLE);
+                $query->where($cratedAtColumn, '>=', $start)
+                    ->where($cratedAtColumn, '<=', $end);
+            }
+        }
+
+        if (isset($sort['student'])) {
+            $query->orderBy(sprintf('%s.lastname', SitelliteUser::TABLE), $sort['student'])
+                ->orderBy(sprintf('%s.firstname', SitelliteUser::TABLE), $sort['student']);
+        }
+        if (isset($sort['class'])) {
+            $query->orderByRaw('cast(class as unsigned) ' . $sort['class']);
+            $query->orderByRaw('cast(class as CHAR CHARACTER SET utf8mb4) ' . $sort['class']);
+        }
+
+        if (isset($sort['started_at'])) {
+            $query->orderBy(sprintf('%s.started_at', Olympiad::TABLE), $sort['started_at']);
+        }
+
+        $transCacheFacade = Core::getTransitionCacheFacade();
+        $handleItem = static function ($item) {
+            if (isset($item->sum_points) && $item->sum_points >= 0) {
+                $resultName = OlympiadParticipant::getResultNames()[$item->result];
+                $item->result_name = $resultName;
+            }
+
+            if ($item->time_from && $item->time_to) {
+                $item->time_from = Carbon::parse($item->time_from)->format('H:i');
+                $item->time_to = Carbon::parse($item->time_to)->format('H:i');
+            }
+            $item->is_confirmed = (bool)$item->is_confirmed;
+            return $item;
+        };
+
+        if (!empty($data['export'])) {
+            $rows = $query->get();
+            $transCacheFacade->getForUsernames($rows->pluck('student_id')->unique()->toArray());
+
+            $spreadsheet = new Spreadsheet();
+            $list = $spreadsheet->getActiveSheet();
+            $title = trans('olympiads.export_filename');
+            $list->setTitle($title);
+
+            $list->getColumnDimension('A')->setWidth(30);
+            $list->getColumnDimension('B')->setWidth(10);
+            $list->getColumnDimension('C')->setWidth(15);
+            $list->getColumnDimension('D')->setWidth(25);
+            $list->getColumnDimension('E')->setWidth(25);
+            $list->getColumnDimension('F')->setWidth(40);
+            $list->getColumnDimension('G')->setWidth(15);
+            $list->getColumnDimension('H')->setWidth(30);
+
+            $list->setCellValue('A1', trans('olympiads.columns.student'));
+            $list->setCellValue('B1', trans('olympiads.columns.class'));
+            $list->setCellValue('C1', trans('olympiads.columns.parallel'));
+            $list->setCellValue('D1', trans('olympiads.columns.subject'));
+            $list->setCellValue('E1', trans('olympiads.columns.started_at'));
+            $list->setCellValue('F1', trans('olympiads.columns.code'));
+            $list->setCellValue('G1', trans('olympiads.columns.result'));
+            $list->setCellValue('H1', trans('olympiads.columns.confirmation'));
+            $list->getStyle('A1:H1')->applyFromArray(['font' => [
+                'bold' => true,
+            ],]);
+
+            $rows = $rows->transform($handleItem);
+            $rowNum = 2;
+            foreach ($rows as $r) {
+                $list->setCellValue('A' . $rowNum, $r->firstname . ' ' . $r->lastname);
+                $list->setCellValue('B' . $rowNum, $r->class);
+                $list->setCellValue('C' . $rowNum, $r->parallel);
+                $list->setCellValue('D' . $rowNum, $r->subject);
+                $list->setCellValue('E' . $rowNum, $r->started_at);
+                $list->setCellValue('F' . $rowNum, $r->code);
+                if ($r->sum_points > 0) {
+                    $list->setCellValue('G' . $rowNum, $r->sum_points . '/' . $r->result_name);
+                }
+
+                $list->setCellValue('H' . $rowNum, $r->is_confirmed ?
+                    trans('olympiads.confirmed') : trans('olympiads.not_confirmed'));
+                $rowNum++;
+            }
+
+            return \EljurXlsxResponse::fromSpreadsheet($spreadsheet, $title);
+        }
+        /**
+         * @var LengthAwarePaginator $paginator
+         */
+        $paginator = $query->paginate($perPage);
+        $transCacheFacade->getForUsernames($paginator->getCollection()->pluck('student_id')->unique()->toArray());
+        $paginator->transform($handleItem);
+
+        return $this->sendResult($paginator);
+    }
+
+    public function actionSetDistribution(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'olympiad_participants_id' => 'int|required',
+            'schedule_id' => 'nullable|int',
+        ]);
+        /**
+         * @var OlympiadParticipant $olympiadParticipant
+         */
+        $olympiadParticipant = OlympiadParticipant::query()->findOrFail($data['olympiad_participants_id']);
+        $olympiadParticipant->schedule_id = $data['schedule_id'];
+        if (isset($data['remove']) && $data['remove'] === true) {
+            $olympiadParticipant->schedule_id = null;
+        }
+        $olympiadParticipant->save();
+        return $this->sendResult();
+    }
+
+    public function actionLoadCodes(Request $request): EljurRawResponse
+    {
+
+        $data = $request->validate([
+            'file' => 'file|required|max:8000',
+        ]);
+        /**
+         * @var Illuminate\Http\UploadedFile $file
+         */
+        $file = $data['file'];
+        $this->subjects = OlympiadSubject::query()->select(['id', 'code'])->whereNotNull('code')->get()
+            ->keyBy('code');
+        $this->exitsCodes = OlympiadCode::query()->pluck('code')->toArray();
+        $mimeType = $file->getClientOriginalExtension();
+        if ($mimeType === 'zip') {
+            $zip = new ZipArchive();
+            $zip->open($file->getPathname());
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $this->insertFromStrCsv($zip->getFromIndex($i));
+            }
+        } elseif ($mimeType === 'csv') {
+            $this->insertFromStrCsv($file->getContent());
+        } else {
+            return $this->sendError();
+        }
+
+        return $this->sendResult();
+    }
+
+    /**
+     * @param Request $request
+     * Автоматическое распределение кодов
+     * @throws Exception
+     */
+    public function actionDistributeCodes(Request $request): EljurRawResponse
+    {
+        $data = $request->validate(['filter' => 'array']);
+        $filter = $data['filter'] ?? [];
+        $query = OlympiadParticipant::query()
+            ->select([
+                sprintf('%s.id', OlympiadParticipant::TABLE),
+                sprintf('%s.olympiad_id', OlympiadParticipant::TABLE),
+                sprintf('%s.parallel', OlympiadParticipant::TABLE)
+            ])
+            ->with(['olympiad' => function ($q) {
+                return $q->select(['id', 'subject_id']);
+            }])
+            ->whereNull('active_code_id');
+        if (isset($filter['class'])) {
+            $students = $this->getStudentsByClass($filter['class']);
+            $studentIds = array_keys($students);
+            if (!$studentIds) {
+                return $this->sendResult([]);
+            }
+            $query->whereIn('student_id', $studentIds);
+        }
+        if (isset($filter['min_parallel'])) {
+            $query->where('parallel', '>=', $filter['min_parallel']);
+        }
+        if (isset($filter['max_parallel'])) {
+            $query->where('parallel', '<=', $filter['max_parallel']);
+        }
+        if (isset($filter['started_at'])) {
+            $query->where('started_at', $filter['started_at']);
+        }
+
+        if (isset($filter['subject_id'])) {
+            $query->join(Olympiad::TABLE, sprintf('%s.id', Olympiad::TABLE), sprintf('%s.olympiad_id', OlympiadParticipant::TABLE))
+                ->where(sprintf('%s.subject_id', Olympiad::TABLE), $filter['subject_id']);
+        }
+
+        $olympiadParticipants = $query->get();
+
+        $codeQuery = OlympiadCode::query()->where('status', OlympiadCode::CODE_FREE);
+        if (isset($filter['subject_id'])) {
+            $codeQuery->where('subject_id', $filter['subject_id']);
+        }
+        if (isset($filter['min_parallel'])) {
+            $codeQuery->where('parallel', '>=', (int)$filter['min_parallel']);
+        }
+        if (isset($filter['max_parallel'])) {
+            $codeQuery->where('parallel', '<=', (int)$filter['max_parallel']);
+        }
+
+        $codes = $codeQuery->get(['subject_id', 'parallel', 'id'])
+            ->groupBy('subject_id')
+            ->map->groupBy('parallel');
+
+        if ($codes->isEmpty()) {
+            return $this->sendError(['type' => 'no_codes_to_distribute', 'message' => trans('olympiads.errors.codes_not_loaded')]);
+        }
+        $this->subjects = OlympiadSubject::query()->select(['id', 'name'])->get()->keyBy('id');
+        $ended = [];
+        /**
+         * @var OlympiadParticipant $participant
+         */
+        foreach ($olympiadParticipants as $participant) {
+            $subjectId = $participant->olympiad->subject_id;
+            $bySubject = $codes->get($subjectId);
+            if ($bySubject
+                && ($byParallel = $bySubject->get($participant->parallel))
+                && ($codeForActivation = $byParallel->shift())
+            ) {
+                $participant->active_code_id = $codeForActivation->id;
+                $participant->save();
+                $codeForActivation->status = OlympiadCode::CODE_ACTIVE;
+                $codeForActivation->participant_id = $participant->id;
+                $codeForActivation->save();
+            } else {
+                $ended[$this->subjects->get($subjectId)->name][] = $participant->parallel;
+            }
+        }
+        if ($ended) {
+            $endedResult = [];
+            foreach ($ended as $subject => $parallels) {
+                $endedResult[] = [
+                    'subject' => $subject,
+                    'parallels' => array_values(array_unique($parallels)),
+                ];
+            }
+            return $this->sendError(['type' => 'not_available_codes', 'message' => $endedResult]);
+        }
+        return $this->sendResult();
+
+    }
+
+    /**
+     * @param Request $request
+     * @return EljurRawResponse
+     * Ручная замена кода (список кодов в селекте)
+     */
+    public function actionListCodes(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'filter' => 'array',
+            'perPage' => 'int'
+        ]);
+        $filter = $data['filter'] ?? [];
+        $perPage = $data['perPage'] ?? 20;
+        $query = OlympiadCode::query()->select(['id', 'code']);
+        $query->where('status', OlympiadCode::CODE_FREE);
+        if ($filter['parallel']) {
+            $query->where('parallel', $filter['parallel']);
+        }
+        if ($filter['subject_id']) {
+            $query->where('subject_id', $filter['subject_id']);
+        }
+        $query = $query->take($perPage);
+
+        return $this->sendResult($query->get());
+    }
+
+    /**
+     * @param Request $request
+     * Ручная замена кода
+     * @throws Exception
+     */
+    public function actionChangeCodeForParticipant(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'new_code_id' => 'nullable|integer',
+            'participant_id' => 'required|int',
+            'option' => 'in:old_used,old_free|nullable'
+        ]);
+
+        /**
+         * @var OlympiadParticipant $participant
+         */
+        $participant = OlympiadParticipant::query()->findOrFail($data['participant_id']);
+        DB::beginTransaction();
+        try {
+            if ($participant->active_code_id && !isset($data['option'])) {
+                throw new Exception(trans('olympiads.errors.need_choose_option'));
+            } else {
+                /**
+                 * @var OlympiadCode $oldCode
+                 */
+                $oldCode = OlympiadCode::query()->find($participant->active_code_id);
+                if ($oldCode) {
+                    if ($data['option'] === 'old_used') {
+                        $oldCode->status = OlympiadCode::CODE_USED;
+                    } elseif ($data['option'] === 'old_free') {
+                        $oldCode->status = OlympiadCode::CODE_FREE;
+                        $oldCode->participant_id = null;
+                    }
+                    $oldCode->save();
+                }
+            }
+            if (isset($data['new_code_id'])) {
+                /**
+                 * @var OlympiadCode $newCode
+                 */
+                $newCode = OlympiadCode::query()->findOrFail($data['new_code_id']);
+                $newCode->participant_id = $data['participant_id'];
+                $newCode->status = OlympiadCode::CODE_ACTIVE;
+                $newCode->save();
+                $participant->active_code_id = $data['new_code_id'];
+
+            } else {
+                $participant->active_code_id = null;
+            }
+            $participant->save();
+        } catch (Exception $exception) {
+            DB::rollBack();
+            throw $exception;
+        }
+        DB::commit();
+        return $this->sendResult();
+    }
+
+    public function actionListOlympiadForStudent(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'perPage' => 'int|max:100',
+        ]);
+        $perPage = $data['perPage'] ?? 10;
+        /**
+         * @var SitelliteUser $user
+         */
+        $user = session_get_user_model();
+        /**
+         * @var Illuminate\Pagination\LengthAwarePaginator $paginator
+         */
+        $paginator = OlympiadParticipant::query()
+            ->select(['id', 'parallel', 'olympiad_id', 'schedule_id', 'active_code_id', 'sum_points', 'result', 'is_confirmed'])
+            ->with([
+                'olympiad' => function ($q) {
+                    return $q->select(['id', 'started_at', 'platform', 'subject_id']);
+                },
+                'olympiad.subject' => function ($q) {
+                    return $q->select(['id', 'name']);
+                },
+                'schedule' => function ($q) {
+                    return $q->select(['id', 'time_from', 'time_to', 'place']);
+                },
+                'code' => function ($q) {
+                    return $q->select(['id', 'code']);
+                },
+            ])
+            ->where('student_id', $user->id)
+            ->paginate($perPage);
+        $now = Carbon::now(conf()->getTimeZone());
+        $paginator->transform(function (OlympiadParticipant $item) use ($now) {
+            if ($item->olympiad->started_at
+                && $item->olympiad->started_at !== trans('olympiads.code_hide')
+                && !($now->format('Y-m-d H:i') >= $item->olympiad->started_at . ' 00:01')
+            ) {
+                $item->code->code = null;
+            }
+            if ($item->code->code && $item->olympiad) {
+                $item->code->setAttribute('enter_url', $item->olympiad->getUrl($item->code->code));
+            }
+            $item->append('result_name');
+            return $item;
+        });
+        return $this->sendResult($paginator);
+    }
+
+    public function actionListChildrenByUser(): EljurRawResponse
+    {
+        $children = SParent::getChildren(false, true);
+        return $this->sendResult($children);
+    }
+
+    /**
+     * Список выбранных олимпиад (родитель) -> вкладка "участие"
+     * @param Request $request
+     * @return EljurRawResponse
+     * @throws Exception
+     */
+    public function actionListParticipantsForParent(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'perPage' => 'int|max:100',
+            'filter' => 'array|required',
+        ]);
+        $perPage = $data['perPage'] ?? 10;
+        $filter = $data['filter'];
+        if (!isset($filter['student_id'])) {
+            throw new Exception(trans('olympiads.errors.need_student'));
+        }
+        /**
+         * @var Illuminate\Pagination\LengthAwarePaginator $paginator
+         */
+        $paginator = OlympiadParticipant::query()
+            ->select(['id', 'parallel', 'is_confirmed', 'olympiad_id', 'student_id', 'schedule_id', 'active_code_id', 'sum_points', 'result'])
+            ->with([
+                'olympiad' => function ($q) {
+                    return $q->select(['id', 'started_at', 'subject_id', 'platform']);
+                },
+                'olympiad.subject' => function ($q) {
+                    return $q->select(['id', 'name']);
+                },
+                'schedule' => function ($q) {
+                    return $q->select(['id', 'time_from', 'time_to', 'place']);
+                },
+                'code' => function ($q) {
+                    return $q->select(['id', 'code']);
+                },
+                'student' => function ($q) {
+                    return $q->select(['id', 'firstname', 'lastname', 'middlename']);
+                },
+            ])
+            ->where('student_id', $filter['student_id'])
+            ->paginate($perPage);
+        $paginator->transform(function (OlympiadParticipant $item) {
+            if ($item->olympiad->started_at
+                && $item->olympiad->started_at !== trans('olympiads.code_hide_parent')
+            ) {
+                $nextDayFromStartAt = Carbon::createFromFormat('Y-m-d', $item->olympiad->started_at)->addDay();
+                $nextDayFromStartAt->startOfDay()->addMinute();
+                if (!now(conf()->getTimeZone())->gt($nextDayFromStartAt)) {
+                    $item->code->code = null;
+                }
+                $item->append('result_name');
+            }
+            return $item;
+        });
+        return $this->sendResult($paginator);
+    }
+
+    public function actionSaveRegulation(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'id' => 'integer',
+            'name' => 'string|required|max:200',
+            'desc' => 'string|max:400',
+            'fid' => 'string|required_without:url|max:32|min:32',
+            'filename' => 'string|required_with:fid',
+            'url' => 'url|required_without:fid|max:2048',
+        ]);
+        if (isset($data['id'])) {
+            $regulation = OlympiadRegulation::query()->findOrFail($data['id']);
+            unset($data['id']);
+        } else {
+            $regulation = new OlympiadRegulation();
+        }
+        $regulation->fill($data);
+        $regulation->save();
+        return $this->sendResult();
+    }
+
+    /**
+     * @throws Exception
+     */
+    public function actionDeleteRegulation(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'id' => 'integer|required',
+        ]);
+        $regulation = OlympiadRegulation::query()->findOrFail($data['id']);
+        $regulation->delete();
+        return $this->sendResult();
+    }
+
+    public function actionListRegulations(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'perPage' => 'int|max:100',
+        ]);
+        $perPage = $data['perPage'] ?? 10;
+        /**
+         * @var $paginator LengthAwarePaginator
+         */
+        $paginator = OlympiadRegulation::query()
+            ->select(['id', 'name', 'desc', 'filename', 'url', 'created_at', 'fid'])
+            ->paginate($perPage);
+        $paginator->transform(static function (OlympiadRegulation $item) {
+            if ($item->fid) {
+                $item->url = \storageManager()->getDownloadLink($item);
+            }
+            $item->append('type');
+            return $item;
+        });
+        return $this->sendResult($paginator);
+    }
+
+    public function actionGenerateUrl(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'participant_id' => 'int',
+        ]);
+        /**
+         * @var OlympiadParticipant $participant
+         */
+        $participant = OlympiadParticipant::query()->findOrFail($data['participant_id']);
+        $code = $participant->code->code ?? '';
+        $url = '';
+        if ($code) {
+            $url = $participant->olympiad->getUrl($code);
+        }
+        return $this->sendResult($url);
+    }
+
+    public function actionLoadResults(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'file' => 'file|required|max:8000',
+        ]);
+        /**
+         * @var Illuminate\Http\UploadedFile $file
+         */
+        $file = $data['file'];
+
+        $mimeType = $file->getClientOriginalExtension();
+        if ($mimeType === 'zip') {
+            $zip = new ZipArchive();
+            $zip->open($file->getPathname());
+            for ($i = 0; $i < $zip->numFiles; $i++) {
+                $this->saveResultsFromStrCsv($zip->getFromIndex($i));
+            }
+        } elseif ($mimeType === 'csv') {
+            $this->saveResultsFromStrCsv($file->getContent());
+        } else {
+            return $this->sendError();
+        }
+
+        return $this->sendResult();
+    }
+
+    public function actionInitAdministrator(): EljurRawResponse
+    {
+        $data['classes'] = Core::getClasses(Core::domainYear());
+        $data['dates'] = Olympiad::query()->distinct()->pluck('started_at');
+        $parallels = Core::getParallels();
+        $data['max_parallel'] = max($parallels);
+        $data['min_parallel'] = min($parallels);
+        $data['subjects'] = OlympiadSubject::all('id', 'name');
+        $data['study_dates'] = Core::getYears()[Core::getCurrentYear()] ?? [];
+
+        return $this->sendResult($data);
+    }
+
+    public function actionChangeResult(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'participant_id' => 'int|required',
+            'result' => 'required_without:sum_points|int',
+            'sum_points' => 'lte:999.9|regex:/^-?[0-9]+(?:\.[0-9])?$/',
+        ]);
+        /**
+         * @var OlympiadParticipant $p
+         */
+        $p = OlympiadParticipant::query()->findOrFail($data['participant_id']);
+        $needEvent = is_null($p->sum_points);
+        $p->result = $data['result'];
+        $p->sum_points = $data['sum_points'];
+        $p->save();
+        if ($needEvent) {
+            event(new OlympiadResult($p));
+        }
+        (new OlympiadPortfolio())->savePortfolioRow($p->student_id, [
+            'subject' => $p->olympiad->subject->name ?? '',
+            'teacher' => '',
+            'result' => $p->result,
+            'participant_id' => $p->id,
+        ]);
+        return $this->sendResult();
+
+    }
+
+    /**
+     * Подтвердить участие родителем
+     * @param Request $request
+     * @return EljurRawResponse
+     */
+    public function actionConfirmParticipation(Request $request): EljurRawResponse
+    {
+        $data = $request->validate([
+            'participant_id' => 'int|required',
+        ]);
+        /**
+         * @var OlympiadParticipant $p
+         */
+        $p = OlympiadParticipant::query()->findOrFail($data['participant_id']);
+        $p->is_confirmed = true;
+        $p->save();
+        return $this->sendResult();
+    }
+
+    /**
+     * @param SitelliteUser $student
+     * @return bool|string
+     */
+    private function getClass(SitelliteUser $student)
+    {
+        $tr = new Transition();
+        return $tr->getStudentClass($student->id);
+    }
+
+    protected function getStudentsByClass(string $c): array
+    {
+        $j = new Journal();
+        return $j->getStudentList($c);
+    }
+
+    protected function insertFromStrCsv(string $txt): void
+    {
+        $insert = [];
+        $rows = str_getcsv($txt, PHP_EOL);
+        foreach ($rows as $key => $row) {
+            if ($key === 0) {
+                continue;
+            }
+            $parsedData = str_getcsv($row, ';');
+            if (isset($parsedData[3])) {
+                $parsedCode = explode('/', $parsedData[3]);
+                $subjectCode = substr($parsedCode[0], 0, -2);
+                $subject = $this->subjects->get($subjectCode);
+                $code = $parsedData[3];
+                if ($code && !in_array($code, $this->exitsCodes, true)) {
+                    $insert[] = [
+                        'code' => $code,
+                        'parallel' => (int)$parsedData[1],
+                        'subject_id' => $subject->id ?? null,
+                        'created_at' => Carbon::now()->format('Y-m-d'),
+                        'updated_at' => Carbon::now()->format('Y-m-d'),
+                        'status' => OlympiadCode::CODE_FREE,
+                    ];
+                }
+            }
+
+
+            if (count($insert) >= 500) {
+                DB::table('olympiad_codes')->insert($insert);
+                $insert = [];
+            }
+        }
+        if ($insert) {
+            DB::table('olympiad_codes')->insert($insert);
+        }
+    }
+
+    protected function saveResultsFromStrCsv(string $txt): EljurRawResponse
+    {
+        $codeResults = [];
+        $rows = str_getcsv($txt, PHP_EOL);
+        foreach ($rows as $key => $row) {
+            if ($key === 0) {
+                continue;
+            }
+            $parsedData = str_getcsv($row, ';');
+            $code = $parsedData[3] ?? '';
+            $result = $parsedData[4] ?? '';
+            $result = str_replace(',', '.', $result);
+
+            if ($code && is_numeric($result)) {
+                $codeResults[$code] = (float)$result;
+            }
+
+        }
+
+        OlympiadCode::query()
+            ->with(['activeParticipant' => function ($q) {
+                return $q->select(['id', 'active_code_id', 'student_id', 'parallel', 'olympiad_id']);
+            }])
+            ->with(['activeParticipant.olympiad' => function ($q) {
+                return $q->select(['id', 'subject_id', 'started_at']);
+            }])
+            ->with(['activeParticipant.olympiad.subject' => function ($q) {
+                return $q->select(['id', 'name']);
+            }])
+            ->with(['activeParticipant.student' => function ($q) {
+                return $q->select(['id', 'firstname', 'middlename', 'lastname']);
+            }])
+            ->with('subject')
+            ->whereIn('code', array_keys($codeResults))
+            ->get(['id', 'code'])
+            ->each(function (OlympiadCode $code) use ($codeResults) {
+                $code->result = $codeResults[$code->code];
+                $code->save();
+                if ($activeParticipant = $code->activeParticipant) {
+                    $activeParticipant->sum_points = $codeResults[$code->code];
+                    $activeParticipant->result = OlympiadParticipant::RESULT_PARTICIPANT;
+                    $activeParticipant->save();
+
+                    (new OlympiadPortfolio())->savePortfolioRow($activeParticipant->student_id, [
+                        'subject' => $activeParticipant->olympiad->subject->name ?? '',
+                        'teacher' => '',
+                        'result' => $activeParticipant->result,
+                        'participant_id' => $activeParticipant->id,
+                    ]);
+                }
+
+            });
+
+        return $this->sendResult();
+    }
+}
